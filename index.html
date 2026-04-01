@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qullamaggie Scanner — Dashboard</title>
+    <meta name="description" content="Scanner automático de acciones basado en los setups de Qullamaggie: Breakouts, Episodic Pivots y Parabolic Stretch.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- PIN Auth Overlay -->
+    <div id="auth-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(10,12,16,0.95);backdrop-filter:blur(10px);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity 0.3s ease;">
+        <div style="background:var(--panel-bg);padding:40px;border-radius:12px;border:1px solid var(--border);text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+            <div style="font-size:32px;margin-bottom:16px;">◈</div>
+            <h2 style="margin-bottom:8px;font-family:var(--font-heading);font-weight:600;">Acceso Restringido</h2>
+            <p style="color:var(--text-muted);margin-bottom:24px;font-size:14px;">Qullamaggie Scanner Dashboard</p>
+            <input type="password" id="pin-input" placeholder="Introduce el PIN" style="width:100%;padding:12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:var(--font-mono);text-align:center;font-size:18px;margin-bottom:16px;outline:none;">
+            <button onclick="checkPIN()" class="btn btn-primary" style="width:100%;padding:12px;font-size:14px;">Desbloquear</button>
+            <p id="pin-error" style="color:var(--negative);margin-top:12px;font-size:13px;display:none;">PIN incorrecto</p>
+        </div>
+    </div>
+    <!-- Header -->
+    <header id="main-header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">◈</span>
+                <span class="logo-text">QLM Scanner</span>
+            </div>
+            <span class="header-subtitle">Qullamaggie Momentum Setups</span>
+        </div>
+        <div class="header-right">
+            <div class="scan-status" id="scan-status">
+                <span class="status-dot"></span>
+                <span class="status-text">En espera</span>
+            </div>
+            <button class="btn btn-primary" id="btn-scan" onclick="triggerScan()" style="background:var(--panel-bg);border:1px solid var(--border);color:var(--text-muted);cursor:default;">
+                <span class="btn-icon">⚡</span> Auto (Git)
+            </button>
+            <div class="last-update" id="last-update"></div>
+        </div>
+    </header>
+
+    <main id="dashboard">
+        <!-- Stats Row -->
+        <section class="stats-grid" id="stats-section">
+            <div class="stat-card stat-equity">
+                <div class="stat-label">Equity Total</div>
+                <div class="stat-value" id="stat-equity">$0.00</div>
+                <div class="stat-change" id="stat-return">+0.00%</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Cash Disponible</div>
+                <div class="stat-value" id="stat-cash">$0.00</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">P&L No Realizado</div>
+                <div class="stat-value" id="stat-unrealized">$0.00</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Win Rate</div>
+                <div class="stat-value" id="stat-winrate">0%</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">R Promedio</div>
+                <div class="stat-value" id="stat-ravg">0.0R</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Trades Totales</div>
+                <div class="stat-value" id="stat-trades">0</div>
+            </div>
+        </section>
+
+        <!-- Two-column layout -->
+        <div class="main-grid">
+            <!-- Left: Positions -->
+            <section class="panel" id="positions-panel">
+                <div class="panel-header">
+                    <h2>📊 Posiciones Activas</h2>
+                    <span class="badge badge-count" id="positions-count">0</span>
+                </div>
+                <div class="panel-body" id="positions-body">
+                    <div class="empty-state">No hay posiciones abiertas</div>
+                </div>
+            </section>
+
+            <!-- Right: Signals -->
+            <section class="panel" id="signals-panel">
+                <div class="panel-header">
+                    <h2>🔔 Señales del Día</h2>
+                    <div class="panel-controls">
+                        <select id="signal-filter" onchange="loadSignals()">
+                            <option value="">Todos</option>
+                            <option value="breakout">Breakout</option>
+                            <option value="ep">Episodic Pivot</option>
+                            <option value="parabolic">Parabolic</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="panel-body" id="signals-body">
+                    <div class="empty-state">Sin señales detectadas</div>
+                </div>
+            </section>
+        </div>
+
+        <!-- History -->
+        <section class="panel" id="history-panel">
+            <div class="panel-header">
+                <h2>📜 Historial de Trades</h2>
+                <span class="badge badge-count" id="history-count">0</span>
+            </div>
+            <div class="table-wrapper">
+                <table class="data-table" id="history-table">
+                    <thead>
+                        <tr>
+                            <th>Símbolo</th>
+                            <th>Setup</th>
+                            <th>Entrada</th>
+                            <th>Salida</th>
+                            <th>P. Entrada</th>
+                            <th>P. Salida</th>
+                            <th>P&L %</th>
+                            <th>P&L $</th>
+                            <th>R</th>
+                            <th>Días</th>
+                            <th>Razón</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-tbody">
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- Toast notifications -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script>
+        // Fake JS PIN Authentication (Security by obscurity)
+        const EXPECTED_PIN_HASH = "1214041765"; // Try to avoid showing plaintext PIN
+        
+        // Simple string hash
+        function hashCode(s) {
+            let h = 0;
+            for(let i = 0; i < s.length; i++) h = Math.imul(31, h) + s.charCodeAt(i) | 0;
+            return h.toString();
+        }
+
+        function checkPIN() {
+            const input = document.getElementById('pin-input').value;
+            const error = document.getElementById('pin-error');
+            
+            if (hashCode(input) === EXPECTED_PIN_HASH) { // Hash for "2026"
+                sessionStorage.setItem('qlm_auth', 'true');
+                document.getElementById('auth-overlay').style.opacity = '0';
+                setTimeout(() => document.getElementById('auth-overlay').style.display = 'none', 300);
+            } else {
+                error.style.display = 'block';
+                document.getElementById('pin-input').value = '';
+            }
+        }
+
+        // Allow pressing Enter
+        document.getElementById('pin-input').addEventListener('keypress', function (e) {
+            if (e.key === 'Enter') checkPIN();
+        });
+
+        // Check if already authenticated
+        if (sessionStorage.getItem('qlm_auth') === 'true') {
+            document.getElementById('auth-overlay').style.display = 'none';
+        }
+    </script>
+    <script src="app.js"></script>
+</body>
+</html>
