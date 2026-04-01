@@ -17,6 +17,8 @@ function loadAll() {
     loadPositions();
     loadSignals();
     loadHistory();
+    loadEquityCurve();
+    loadAnalytics();
     checkScanStatus();
     updateTimestamp();
 }
@@ -312,6 +314,7 @@ function setupBadgeClass(setup) {
         'breakout': 'badge-breakout',
         'ep': 'badge-ep',
         'parabolic': 'badge-parabolic',
+        'vcp': 'badge-breakout',
     };
     return map[setup] || 'badge-count';
 }
@@ -331,4 +334,204 @@ function showToast(message, type = 'info') {
         toast.style.transition = 'all 0.3s ease';
         setTimeout(() => toast.remove(), 300);
     }, 4000);
+}
+
+// ── Equity Curve Chart ─────────────────────────────────────
+
+let equityChart = null;
+
+async function loadEquityCurve() {
+    const data = await api('api/equity.json');
+    const canvas = document.getElementById('equity-chart');
+    const emptyMsg = document.getElementById('equity-empty');
+    if (!canvas) return;
+
+    if (!data || data.length === 0) {
+        canvas.style.display = 'none';
+        if (emptyMsg) emptyMsg.style.display = 'block';
+        return;
+    }
+
+    canvas.style.display = 'block';
+    if (emptyMsg) emptyMsg.style.display = 'none';
+
+    const labels = data.map(d => d.snap_date);
+    const equityValues = data.map(d => d.total_equity);
+    const initialCapital = equityValues.length > 0 ? equityValues[0] : 10000;
+
+    // Determine gradient colors based on last vs first
+    const lastVal = equityValues[equityValues.length - 1];
+    const isPositive = lastVal >= initialCapital;
+
+    if (equityChart) {
+        equityChart.destroy();
+    }
+
+    const ctx = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height * 2);
+    if (isPositive) {
+        gradient.addColorStop(0, 'rgba(63, 185, 80, 0.3)');
+        gradient.addColorStop(1, 'rgba(63, 185, 80, 0.0)');
+    } else {
+        gradient.addColorStop(0, 'rgba(248, 81, 73, 0.3)');
+        gradient.addColorStop(1, 'rgba(248, 81, 73, 0.0)');
+    }
+
+    equityChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: 'Equity',
+                data: equityValues,
+                borderColor: isPositive ? '#3fb950' : '#f85149',
+                backgroundColor: gradient,
+                borderWidth: 2,
+                fill: true,
+                tension: 0.3,
+                pointRadius: data.length > 30 ? 0 : 3,
+                pointHoverRadius: 5,
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                intersect: false,
+                mode: 'index',
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            const val = ctx.raw;
+                            const ret = ((val / initialCapital - 1) * 100).toFixed(2);
+                            return `$${val.toLocaleString('en-US', {minimumFractionDigits: 2})} (${ret >= 0 ? '+' : ''}${ret}%)`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: { color: 'rgba(48, 54, 61, 0.5)' },
+                    ticks: {
+                        color: '#8b949e',
+                        maxTicksLimit: 10,
+                        font: { size: 10 },
+                    }
+                },
+                y: {
+                    grid: { color: 'rgba(48, 54, 61, 0.5)' },
+                    ticks: {
+                        color: '#8b949e',
+                        callback: function(value) {
+                            return '$' + value.toLocaleString();
+                        },
+                        font: { size: 10 },
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ── Analytics Forward Returns Chart ──────────────────────────
+
+let analyticsChart = null;
+
+async function loadAnalytics() {
+    const data = await api('api/analytics.json');
+    const canvas = document.getElementById('analytics-chart');
+    const emptyMsg = document.getElementById('analytics-empty');
+    if (!canvas) return;
+
+    if (!data || data.length === 0) {
+        canvas.style.display = 'none';
+        if (emptyMsg) emptyMsg.style.display = 'block';
+        return;
+    }
+
+    canvas.style.display = 'block';
+    if (emptyMsg) emptyMsg.style.display = 'none';
+
+    setText('stat-signals-evaluated', data.length);
+
+    let mfeSum = 0;
+    let maeSum = 0;
+    let hits = 0;
+
+    const setupStats = {};
+
+    data.forEach(d => {
+        mfeSum += d.mfe_pct;
+        maeSum += d.mae_pct;
+        const isHit = d.mfe_pct >= 0.10; // Hit if it goes +10% 
+        if (isHit) hits++;
+
+        if (!setupStats[d.setup_type]) {
+            setupStats[d.setup_type] = { count: 0, hits: 0 };
+        }
+        setupStats[d.setup_type].count++;
+        if (isHit) setupStats[d.setup_type].hits++;
+    });
+
+    const avgMfe = (mfeSum / data.length) * 100;
+    const avgMae = (maeSum / data.length) * 100;
+    const hitRate = (hits / data.length) * 100;
+
+    setText('stat-mfe-avg', `+${avgMfe.toFixed(2)}%`);
+    setText('stat-mae-avg', `${avgMae.toFixed(2)}%`);
+    setText('stat-hit-rate', `${hitRate.toFixed(1)}%`);
+
+    const labels = Object.keys(setupStats);
+    const chartData = labels.map(l => (setupStats[l].hits / setupStats[l].count) * 100);
+
+    if (analyticsChart) {
+        analyticsChart.destroy();
+    }
+
+    const ctx = canvas.getContext('2d');
+    analyticsChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels.map(l => l.toUpperCase()),
+            datasets: [{
+                label: 'Hit Rate (>10% MFE)',
+                data: chartData,
+                backgroundColor: 'rgba(63, 185, 80, 0.8)',
+                borderRadius: 4,
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            return ctx.raw.toFixed(1) + '%';
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    grid: { color: 'rgba(48, 54, 61, 0.5)' },
+                    ticks: {
+                        color: '#8b949e',
+                        font: { size: 10 },
+                        callback: function(value) { return value + '%'; }
+                    }
+                },
+                x: {
+                    grid: { display: false },
+                    ticks: { color: '#8b949e', font: { size: 11, weight: 'bold' } }
+                }
+            }
+        }
+    });
 }

@@ -96,6 +96,7 @@
                             <option value="breakout">Breakout</option>
                             <option value="ep">Episodic Pivot</option>
                             <option value="parabolic">Parabolic</option>
+                            <option value="vcp">VCP</option>
                         </select>
                     </div>
                 </div>
@@ -131,6 +132,49 @@
                     <tbody id="history-tbody">
                     </tbody>
                 </table>
+            </div>
+        </section>
+
+        <!-- Equity Curve Chart -->
+        <section class="panel" id="equity-panel">
+            <div class="panel-header">
+                <h2>📈 Curva de Equity</h2>
+            </div>
+            <div class="panel-body" style="padding:16px;">
+                <canvas id="equity-chart" height="120"></canvas>
+                <div class="empty-state" id="equity-empty" style="display:none;">Sin datos de equity todavia. Se generaran con el primer escaneo.</div>
+            </div>
+        </section>
+
+        <!-- Analytics Section (NEW) -->
+        <section class="panel" id="analytics-panel">
+            <div class="panel-header">
+                <h2>🎯 Eficacia de Señales (Forward T+10 MFE)</h2>
+            </div>
+            <div class="panel-body" style="padding:16px; display:flex; gap: 20px; flex-wrap: wrap;">
+                <div style="flex: 1; min-width: 300px;">
+                    <canvas id="analytics-chart" height="200"></canvas>
+                    <div class="empty-state" id="analytics-empty" style="display:none;">Recogiendo datos... El rendimiento prospectivo se calcula tras 10 días desde la señal.</div>
+                </div>
+                <div style="flex: 1; min-width: 300px; display: flex; flex-direction: column; justify-content: center;">
+                    <h3 style="margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px;">Métricas Globales (T>10d)</h3>
+                    <div class="pos-detail" style="margin-bottom: 8px;">
+                        <span class="pos-detail-label">Señales Evaluadas:</span>
+                        <span class="pos-detail-value" id="stat-signals-evaluated">0</span>
+                    </div>
+                    <div class="pos-detail" style="margin-bottom: 8px;">
+                        <span class="pos-detail-label">Promedio Excursión a Favor (MFE):</span>
+                        <span class="pos-detail-value positive" id="stat-mfe-avg">0.0%</span>
+                    </div>
+                    <div class="pos-detail" style="margin-bottom: 8px;">
+                        <span class="pos-detail-label">Promedio Caída Máxima (MAE):</span>
+                        <span class="pos-detail-value negative" id="stat-mae-avg">0.0%</span>
+                    </div>
+                    <div class="pos-detail" style="margin-bottom: 8px;">
+                        <span class="pos-detail-label">Hit Rate (>10% Gain):</span>
+                        <span class="pos-detail-value" id="stat-hit-rate">0.0%</span>
+                    </div>
+                </div>
             </div>
         </section>
     </main>
