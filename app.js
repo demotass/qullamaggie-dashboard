@@ -1,18 +1,41 @@
 /* ============================================================
    Qullamaggie Scanner — Dashboard JavaScript
+   Supports both LOCAL (Flask) and STATIC (GitHub Pages) modes.
    ============================================================ */
 
-const REFRESH_INTERVAL = 30000; // 30 seconds
+const REFRESH_INTERVAL = 30000;
 let refreshTimer = null;
+let IS_LOCAL = false;
+let _sellPositionId = null;
+let _stopPositionId = null;
 
 // ── Initialization ──────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    await detectMode();
     loadAll();
     startAutoRefresh();
 });
 
+async function detectMode() {
+    const isLocal = location.hostname === 'localhost' 
+        || location.hostname === '127.0.0.1' 
+        || location.hostname.startsWith('192.168.')
+        || location.hostname.startsWith('10.');
+    IS_LOCAL = isLocal;
+    
+    if (IS_LOCAL) {
+        // Hide PIN overlay immediately on local network
+        const overlay = document.getElementById('auth-overlay');
+        if (overlay) overlay.style.display = 'none';
+        // Show interactive buttons
+        const btnCapital = document.getElementById('btn-capital');
+        if (btnCapital) btnCapital.style.display = '';
+    }
+}
+
 function loadAll() {
+    if (IS_LOCAL) loadPendingActions();
     loadStats();
     loadPositions();
     loadSignals();
@@ -38,7 +61,8 @@ function updateTimestamp() {
 
 // ── API Helpers ─────────────────────────────────────────────
 
-async function api(url) {
+async function apiGet(endpoint) {
+    const url = IS_LOCAL ? `/api/${endpoint}` : `api/${endpoint}.json`;
     try {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -49,18 +73,42 @@ async function api(url) {
     }
 }
 
+async function apiPost(endpoint, data) {
+    try {
+        const res = await fetch(`/api/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+        return await res.json();
+    } catch (err) {
+        console.error(`POST error:`, err);
+        return null;
+    }
+}
+
+async function apiDelete(endpoint) {
+    try {
+        const res = await fetch(`/api/${endpoint}`, { method: 'DELETE' });
+        return await res.json();
+    } catch (err) {
+        console.error(`DELETE error:`, err);
+        return null;
+    }
+}
+
 // ── Stats ───────────────────────────────────────────────────
 
 async function loadStats() {
-    const stats = await api('api/stats.json');
+    const stats = await apiGet('stats');
     if (!stats) return;
 
-    setText('stat-equity', formatCurrency(stats.total_equity));
-    setText('stat-cash', formatCurrency(stats.cash));
+    setText('stat-equity', formatEUR(stats.total_equity));
+    setText('stat-cash', formatEUR(stats.cash));
 
     const unrealizedEl = document.getElementById('stat-unrealized');
     if (unrealizedEl) {
-        unrealizedEl.textContent = formatCurrency(stats.unrealized_pnl);
+        unrealizedEl.textContent = formatCurrency(stats.unrealized_pnl) + " (USD)";
         unrealizedEl.className = 'stat-value ' + pnlClass(stats.unrealized_pnl);
     }
 
@@ -76,10 +124,90 @@ async function loadStats() {
     setText('stat-trades', stats.total_trades || 0);
 }
 
+// ── Pending Actions (Copilot) ───────────────────────────────
+
+async function loadPendingActions() {
+    const actions = await apiGet('pending');
+    const panel = document.getElementById('pending-panel');
+    const countEl = document.getElementById('pending-count');
+    const body = document.getElementById('pending-body');
+    
+    if (!panel || !body) return;
+
+    if (!actions || actions.length === 0) {
+        panel.style.display = 'none';
+        if (countEl) countEl.textContent = '0';
+        return;
+    }
+
+    panel.style.display = 'block';
+    if (countEl) countEl.textContent = actions.length;
+
+    body.innerHTML = actions.map(act => {
+        let actionBadge = '';
+        let colorClass = '';
+        
+        switch(act.action_type) {
+            case 'BUY':
+                actionBadge = 'COMPRAR'; colorClass = 'positive'; break;
+            case 'SELL_ALL':
+            case 'STOPPED':
+                actionBadge = 'VENDER TODO'; colorClass = 'negative'; break;
+            case 'SELL_PARTIAL':
+                actionBadge = 'VENTA PARCIAL'; colorClass = 'warning'; break;
+            case 'UPDATE_STOP':
+                actionBadge = 'NUEVO STOP'; colorClass = 'accent-blue'; break;
+            default:
+                actionBadge = act.action_type;
+        }
+
+        const details = act.action_type === 'BUY' 
+            ? `${act.shares} accs @ $${act.price.toFixed(2)} (Stop: $${act.stop_price.toFixed(2)})`
+            : `${act.shares > 0 ? act.shares + ' accs @ ' : ''}$${act.price.toFixed(2)}`;
+
+        return `
+            <div style="background:var(--bg-card-hover); padding:12px 16px; border-radius:var(--radius-sm); border-left:3px solid var(--${colorClass}); display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <div style="margin-bottom:6px;">
+                        <span style="font-weight:bold; font-size:16px;">${act.symbol}</span>
+                        <span class="badge" style="background:var(--${colorClass}-bg); color:var(--${colorClass}); margin-left:8px;">${actionBadge}</span>
+                    </div>
+                    <div style="font-size:13px; color:var(--text-secondary); margin-bottom:4px;">${act.reason}</div>
+                    <div style="font-family:var(--font-mono); font-size:12px; color:var(--text-muted);">${details}</div>
+                </div>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn-action" style="border-color:var(--positive); color:var(--positive);" onclick="approvePendingAction(${act.id}, '${act.symbol}')">✅ Aprobar</button>
+                    <button class="btn-action" style="border-color:var(--negative); color:var(--negative);" onclick="rejectPendingAction(${act.id}, '${act.symbol}')">❌ Rechazar</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+async function approvePendingAction(id, symbol) {
+    const res = await apiPost(`pending/${id}/approve`, {});
+    if (res && res.status === 'approved') {
+        showToast(`Acción aprobada para ${symbol}`, 'success');
+        loadAll();
+    } else {
+        showToast(`Error al aprobar ${symbol}`, 'error');
+    }
+}
+
+async function rejectPendingAction(id, symbol) {
+    const res = await apiPost(`pending/${id}/reject`, {});
+    if (res && res.status === 'rejected') {
+        showToast(`Acción rechazada para ${symbol}`, 'info');
+        loadAll();
+    } else {
+        showToast(`Error al rechazar ${symbol}`, 'error');
+    }
+}
+
 // ── Positions ───────────────────────────────────────────────
 
 async function loadPositions() {
-    const positions = await api('api/portfolio.json');
+    const positions = await apiGet('portfolio');
     if (!positions) return;
 
     const count = document.getElementById('positions-count');
@@ -106,14 +234,23 @@ async function loadPositions() {
             'SELL_PARTIAL': 'badge-watch', 'SELL_ALL': 'badge-sell', 'STOPPED': 'badge-sell'
         };
 
-        const daysSinceEntry = pos.entry_date ?
-            Math.floor((Date.now() - new Date(pos.entry_date).getTime()) / 86400000) : 0;
+        // FIX: Use entry_date from DB and show it
+        const entryDate = pos.entry_date || '';
+        const daysSinceEntry = entryDate ?
+            Math.max(0, Math.floor((Date.now() - new Date(entryDate + 'T12:00:00').getTime()) / 86400000)) : 0;
 
         const shares = pos.shares || 0;
         const invested = (pos.entry_price || 0) * shares;
         const pnlAbs = pos.pnl_abs || ((pos.last_close || 0) - (pos.entry_price || 0)) * shares;
-        const riskPerShare = (pos.entry_price || 0) - (pos.initial_stop || pos.current_stop || 0);
-        const riskTotal = riskPerShare * shares;
+
+        // Action buttons (only in local mode)
+        const actions = IS_LOCAL ? `
+            <div class="pos-actions">
+                <button class="btn-action btn-action-sell" onclick="openSellModal(${pos.id}, '${pos.symbol}', ${shares}, ${pos.last_close || pos.entry_price})">🔴 Vender</button>
+                <button class="btn-action btn-action-edit" onclick="openStopModal(${pos.id}, '${pos.symbol}', ${pos.current_stop || 0})">✏️ Stop</button>
+                <button class="btn-action btn-action-delete" onclick="deletePosition(${pos.id}, '${pos.symbol}')">🗑️</button>
+            </div>
+        ` : '';
 
         return `
             <div class="position-card">
@@ -128,6 +265,10 @@ async function loadPositions() {
                     </div>
                 </div>
                 <div class="pos-details" style="grid-template-columns:repeat(6,1fr)">
+                    <div class="pos-detail">
+                        <div class="pos-detail-label">Fecha</div>
+                        <div class="pos-detail-value">${entryDate}</div>
+                    </div>
                     <div class="pos-detail">
                         <div class="pos-detail-label">Acciones</div>
                         <div class="pos-detail-value">${shares}</div>
@@ -145,10 +286,6 @@ async function loadPositions() {
                         <div class="pos-detail-value" style="color:var(--negative)">$${(pos.current_stop || 0).toFixed(2)}</div>
                     </div>
                     <div class="pos-detail">
-                        <div class="pos-detail-label">Invertido</div>
-                        <div class="pos-detail-value">${formatCurrency(invested)}</div>
-                    </div>
-                    <div class="pos-detail">
                         <div class="pos-detail-label">Dias</div>
                         <div class="pos-detail-value">${daysSinceEntry}</div>
                     </div>
@@ -158,6 +295,7 @@ async function loadPositions() {
                     ${pos.partial_sold ? '<span class="badge badge-watch" style="margin-left:6px">PARCIAL VENDIDO</span>' : ''}
                     ${pos.notes ? `<span style="margin-left:8px;color:var(--text-muted);font-size:11px">${pos.notes}</span>` : ''}
                 </div>
+                ${actions}
             </div>
         `;
     }).join('');
@@ -168,16 +306,14 @@ async function loadPositions() {
 async function loadSignals() {
     const filter = document.getElementById('signal-filter');
     const setupType = filter ? filter.value.toLowerCase() : '';
-    
-    let allSignals = await api('api/signals.json');
+
+    let allSignals = await apiGet('signals');
     if (!allSignals) return;
 
-    // Static site filtering
     if (setupType) {
         allSignals = allSignals.filter(sig => sig.setup_type && sig.setup_type.toLowerCase() === setupType);
     }
-    
-    // Status sorting: ready first, then near
+
     allSignals.sort((a, b) => {
         const statusA = a.status || 'near';
         const statusB = b.status || 'near';
@@ -189,7 +325,7 @@ async function loadSignals() {
     if (!body) return;
 
     if (allSignals.length === 0) {
-        body.innerHTML = '<div class="empty-state">Sin señales detectadas hoy</div>';
+        body.innerHTML = '<div class="empty-state">Sin señales detectadas</div>';
         return;
     }
 
@@ -198,13 +334,15 @@ async function loadSignals() {
         const score = (sig.score || 0) * 100;
         const guidance = Array.isArray(sig.guidance) ? sig.guidance : [];
         const guidanceText = guidance.slice(0, 2).join(' · ');
+        const scanDate = sig.scan_date ? `<span style="font-size:10px;color:var(--text-dim);margin-left:6px">${sig.scan_date}</span>` : '';
 
         return `
             <div class="signal-card ${status}">
                 <div class="signal-left">
-                    <span class="signal-symbol">${sig.symbol}</span>
+                    <span class="signal-symbol" style="cursor:pointer;text-decoration:underline;" onclick="openChartModal('${sig.symbol}', '${sig.setup_type}')">${sig.symbol}</span>
                     <span class="badge ${setupBadgeClass(sig.setup_type)}">${sig.setup_type}</span>
                     ${status === 'ready' ? '<span class="badge badge-hold">READY</span>' : '<span class="badge badge-watch">NEAR</span>'}
+                    ${scanDate}
                 </div>
                 <div class="signal-right">
                     <div class="signal-score" style="color:${score >= 85 ? 'var(--positive)' : score >= 50 ? 'var(--warning)' : 'var(--text-muted)'}">${score.toFixed(0)}%</div>
@@ -215,10 +353,289 @@ async function loadSignals() {
     }).join('');
 }
 
+let chartState = {
+    symbol: '',
+    period: '365d',
+    setupType: '',
+    data: [],
+    charts: { main: null, vol: null, rsi: null, macd: null, stoch: null },
+    series: {},
+    indicators: {
+        ema10: true, ema20: true, ema50: true,
+        sma150: false, sma200: false,
+        volume: true, rsi: false, macd: false, stoch: false
+    }
+};
+
+let _currentSignal = null;
+
+async function openChartModal(symbol, setupType, signalData) {
+    const modal = document.getElementById('chart-modal');
+    if (!modal) return;
+    modal.style.display = 'flex';
+    
+    document.getElementById('chart-modal-title').textContent = `${symbol} — ${setupType.toUpperCase()}`;
+    
+    chartState.symbol = symbol;
+    chartState.setupType = setupType;
+    _currentSignal = signalData || { symbol, setup_type: setupType };
+    
+    document.getElementById('chart-btn-buy').onclick = () => confirmSignalFromChart(symbol, setupType);
+    document.getElementById('chart-btn-wait').onclick = () => {
+        showToast(`${symbol} marcado para seguimiento`, 'info');
+        hideChartModal();
+    };
+    document.getElementById('chart-btn-discard').onclick = () => hideChartModal();
+
+    await loadChartData();
+}
+
+async function loadChartData() {
+    const panels = document.getElementById('chart-panels');
+    panels.innerHTML = `
+        <div id="tv-chart-main" class="chart-panel-main"></div>
+        <div id="tv-chart-vol" class="chart-panel-osc" style="display:none;"></div>
+        <div id="tv-chart-rsi" class="chart-panel-osc" style="display:none;"></div>
+        <div id="tv-chart-macd" class="chart-panel-osc" style="display:none;"></div>
+        <div id="tv-chart-stoch" class="chart-panel-osc" style="display:none;"></div>
+    `;
+
+    document.getElementById('tv-chart-main').innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px">⏳ Cargando gráfico...</div>';
+
+    const data = await apiGet(`chart/${chartState.symbol}?period=${chartState.period}`);
+    if (!data || !Array.isArray(data) || data.length === 0) {
+        document.getElementById('tv-chart-main').innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--negative);font-size:14px">⚠️ Error cargando datos de ' + chartState.symbol + '</div>';
+        return;
+    }
+    chartState.data = data;
+    renderCharts();
+}
+
+function renderCharts() {
+    Object.values(chartState.charts).forEach(c => { if(c) { try{c.remove()}catch(e){} } });
+    chartState.charts = { main: null, vol: null, rsi: null, macd: null, stoch: null };
+    chartState.series = {};
+
+    const data = chartState.data;
+    const commonOpt = {
+        layout: { background: { type: 'solid', color: '#0d1117' }, textColor: '#e2e8f0' },
+        grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+        crosshair: { mode: 1 },
+        timeScale: { borderColor: 'rgba(255,255,255,0.1)', timeVisible: true }
+    };
+
+    const showVol = chartState.indicators.volume;
+    const showRsi = chartState.indicators.rsi;
+    const showMacd = chartState.indicators.macd;
+    const showStoch = chartState.indicators.stoch;
+
+    document.getElementById('tv-chart-vol').style.display = showVol ? 'block' : 'none';
+    document.getElementById('tv-chart-rsi').style.display = showRsi ? 'block' : 'none';
+    document.getElementById('tv-chart-macd').style.display = showMacd ? 'block' : 'none';
+    document.getElementById('tv-chart-stoch').style.display = showStoch ? 'block' : 'none';
+
+    // Main Chart
+    const mainC = document.getElementById('tv-chart-main');
+    mainC.innerHTML = '';
+    const mainChart = LightweightCharts.createChart(mainC, {
+        ...commonOpt, width: mainC.clientWidth, height: mainC.clientHeight
+    });
+    chartState.charts.main = mainChart;
+
+    const candleSeries = mainChart.addCandlestickSeries({
+        upColor: '#10b981', downColor: '#ef4444', borderVisible: false,
+        wickUpColor: '#10b981', wickDownColor: '#ef4444'
+    });
+    candleSeries.setData(data.map(d => ({time: d.time, open: d.open, high: d.high, low: d.low, close: d.close})));
+    
+    // Moving Averages
+    const addMA = (key, color, width, style) => {
+        const sData = data.filter(d => d[key] != null).map(d => ({time: d.time, value: d[key]}));
+        if(sData.length > 0) {
+            const series = mainChart.addLineSeries({ color, lineWidth: width, lineStyle: style, title: key.toUpperCase(), visible: chartState.indicators[key] });
+            series.setData(sData);
+            chartState.series[key] = series;
+        }
+    };
+    addMA('ema10', '#3b82f6', 2, 0); // Blue solid
+    addMA('ema20', '#10b981', 2, 0); // Green solid
+    addMA('ema50', '#f59e0b', 2, 0); // Orange solid
+    addMA('sma150', '#ec4899', 2, 2); // Pink dashed
+    addMA('sma200', '#8b5cf6', 2, 2); // Purple dashed
+
+    // Vol
+    if (showVol) {
+        const c = document.getElementById('tv-chart-vol');
+        c.innerHTML = '';
+        const ch = LightweightCharts.createChart(c, { ...commonOpt, width: c.clientWidth, height: c.clientHeight });
+        chartState.charts.vol = ch;
+        const volSeries = ch.addHistogramSeries({ color: 'rgba(59,130,246,0.5)', priceFormat: { type: 'volume' } });
+        volSeries.setData(data.map(d => ({ time: d.time, value: d.volume, color: d.close >= d.open ? 'rgba(16,185,129,0.5)' : 'rgba(239,68,68,0.5)' })));
+        
+        const volMaData = data.filter(d => d.vol_ma20 != null).map(d => ({time: d.time, value: d.vol_ma20}));
+        if(volMaData.length > 0) {
+            ch.addLineSeries({ color: 'rgba(255,255,255,0.4)', lineWidth: 1, title: 'SMA20' }).setData(volMaData);
+        }
+    }
+
+    // RSI
+    if (showRsi) {
+        const c = document.getElementById('tv-chart-rsi');
+        c.innerHTML = '';
+        const ch = LightweightCharts.createChart(c, { ...commonOpt, width: c.clientWidth, height: c.clientHeight });
+        chartState.charts.rsi = ch;
+        const rsiSeries = ch.addLineSeries({ color: '#8b5cf6', lineWidth: 1, title: 'RSI 14' });
+        rsiSeries.setData(data.filter(d => d.rsi != null).map(d => ({time: d.time, value: d.rsi})));
+        rsiSeries.createPriceLine({ price: 70, color: 'rgba(255,255,255,0.2)', lineWidth: 1, lineStyle: 2 });
+        rsiSeries.createPriceLine({ price: 30, color: 'rgba(255,255,255,0.2)', lineWidth: 1, lineStyle: 2 });
+    }
+
+    // MACD
+    if (showMacd) {
+        const c = document.getElementById('tv-chart-macd');
+        c.innerHTML = '';
+        const ch = LightweightCharts.createChart(c, { ...commonOpt, width: c.clientWidth, height: c.clientHeight });
+        chartState.charts.macd = ch;
+        const macdLine = ch.addLineSeries({ color: '#3b82f6', lineWidth: 1, title: 'MACD' });
+        const signalLine = ch.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: 'Sig' });
+        const histLine = ch.addHistogramSeries({ title: 'Hist' });
+        macdLine.setData(data.filter(d => d.macd != null).map(d => ({time: d.time, value: d.macd})));
+        signalLine.setData(data.filter(d => d.macd_signal != null).map(d => ({time: d.time, value: d.macd_signal})));
+        histLine.setData(data.filter(d => d.macd_hist != null).map(d => ({time: d.time, value: d.macd_hist, color: d.macd_hist >= 0 ? '#10b981' : '#ef4444'})));
+    }
+
+    // STOCH
+    if (showStoch) {
+        const c = document.getElementById('tv-chart-stoch');
+        c.innerHTML = '';
+        const ch = LightweightCharts.createChart(c, { ...commonOpt, width: c.clientWidth, height: c.clientHeight });
+        chartState.charts.stoch = ch;
+        const kLine = ch.addLineSeries({ color: '#3b82f6', lineWidth: 1, title: '%K' });
+        const dLine = ch.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: '%D' });
+        kLine.setData(data.filter(d => d.stoch_k != null).map(d => ({time: d.time, value: d.stoch_k})));
+        dLine.setData(data.filter(d => d.stoch_d != null).map(d => ({time: d.time, value: d.stoch_d})));
+        kLine.createPriceLine({ price: 80, color: 'rgba(255,255,255,0.2)', lineWidth: 1, lineStyle: 2 });
+        kLine.createPriceLine({ price: 20, color: 'rgba(255,255,255,0.2)', lineWidth: 1, lineStyle: 2 });
+    }
+
+    // Sync charts
+    const chartsArr = Object.values(chartState.charts).filter(c => c !== null);
+    if (chartsArr.length > 1) {
+        let isSyncing = false;
+        chartsArr.forEach((chart) => {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+                if (isSyncing || !range) return;
+                isSyncing = true;
+                chartsArr.forEach(c => {
+                    if (c !== chart) c.timeScale().setVisibleLogicalRange(range);
+                });
+                isSyncing = false;
+            });
+            chart.subscribeCrosshairMove(param => {
+                if(isSyncing || !param.time) return;
+                isSyncing = true;
+                chartsArr.forEach(c => {
+                    if (c !== chart && param.point) {
+                        try { c.setCrosshairPosition(param.point.x, param.point.y, param.series); } catch(e){}
+                    }
+                });
+                isSyncing = false;
+            });
+        });
+    }
+
+    mainChart.timeScale().fitContent();
+
+    // Meta display
+    const last = data[data.length-1];
+    if (last) {
+        document.getElementById('chart-meta').textContent = `Volume: ${last.volume ? (last.volume/1e6).toFixed(2)+'M' : 'N/A'} · ADR: ${last.adr ? last.adr.toFixed(2)+'%' : 'N/A'}`;
+    }
+}
+
+// UI Setup for Chart
+document.addEventListener('DOMContentLoaded', () => {
+    // Period clicks
+    document.querySelectorAll('.period-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            chartState.period = btn.dataset.period;
+            loadChartData();
+        });
+    });
+
+    // Indicator clicks
+    document.querySelectorAll('.ind-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const ind = btn.dataset.ind;
+            chartState.indicators[ind] = !chartState.indicators[ind];
+            
+            if (chartState.indicators[ind]) btn.classList.add('active');
+            else btn.classList.remove('active');
+
+            if (['volume', 'rsi', 'macd', 'stoch'].includes(ind)) {
+                renderCharts(); // complete rebuild for layout changes
+            } else {
+                if (chartState.series[ind]) {
+                    chartState.series[ind].applyOptions({ visible: chartState.indicators[ind] });
+                }
+            }
+        });
+    });
+
+    // Resize handler
+    window.addEventListener('resize', () => {
+        const panels = {
+            main: 'tv-chart-main',
+            vol: 'tv-chart-vol',
+            rsi: 'tv-chart-rsi',
+            macd: 'tv-chart-macd',
+            stoch: 'tv-chart-stoch'
+        };
+        for(const [key, ch] of Object.entries(chartState.charts)) {
+            if(ch) {
+                const el = document.getElementById(panels[key]);
+                if(el) ch.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+            }
+        }
+    });
+
+    const chartModal = document.getElementById('chart-modal');
+    if (chartModal) {
+        chartModal.addEventListener('click', (e) => {
+            if (e.target.classList.contains('chart-modal-overlay')) hideChartModal();
+        });
+    }
+});
+
+function hideChartModal() {
+    const modal = document.getElementById('chart-modal');
+    if (modal) modal.style.display = 'none';
+    Object.values(chartState.charts).forEach(c => { if(c) { try{c.remove()}catch(e){} } });
+    chartState.charts = { main: null, vol: null, rsi: null, macd: null, stoch: null };
+}
+
+async function confirmSignalFromChart(symbol, setupType) {
+    const result = await apiPost('pending', {
+        symbol, action_type: 'BUY', setup_type: setupType,
+        reason: `Aprobación manual desde gráfico (${setupType.toUpperCase()})`,
+        shares: 0, price: 0, stop_price: 0, fx_rate: 1.0
+    });
+    if (result) {
+        showToast(`✅ Señal de ${symbol} añadida a Acciones Sugeridas`, 'success');
+        hideChartModal();
+        loadAll();
+    } else {
+        showToast(`Error procesando señal de ${symbol}`, 'error');
+    }
+}
+
+
 // ── History ─────────────────────────────────────────────────
 
 async function loadHistory() {
-    const trades = await api('api/history.json');
+    const trades = await apiGet('history');
     if (!trades) return;
 
     const count = document.getElementById('history-count');
@@ -242,8 +659,8 @@ async function loadHistory() {
                 <td><span class="badge ${setupBadgeClass(t.setup_type)}">${t.setup_type}</span></td>
                 <td>${t.entry_date || ''}</td>
                 <td>${t.exit_date || ''}</td>
-                <td>$${(t.entry_price || 0).toFixed(2)}</td>
-                <td>$${(t.exit_price || 0).toFixed(2)}</td>
+                <td>€${(t.entry_price || 0).toFixed(2)}</td>
+                <td>€${(t.exit_price || 0).toFixed(2)}</td>
                 <td class="${pnlClass(pnlPct)}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%</td>
                 <td class="${pnlClass(pnlAbs)}">${formatCurrency(pnlAbs)}</td>
                 <td class="${pnlClass(rMult)}">${rMult >= 0 ? '+' : ''}${rMult.toFixed(1)}R</td>
@@ -254,14 +671,26 @@ async function loadHistory() {
     }).join('');
 }
 
-// ── Scan Trigger ────────────────────────────────────────────
+// ── Scan ────────────────────────────────────────────────────
 
 async function triggerScan() {
-    showToast('El escaneo ocurre automáticamente en GitHub Actions (Lun-Vie 22:30 UTC).', 'info');
+    if (!IS_LOCAL) {
+        showToast('El escaneo se ejecuta automáticamente vía GitHub Actions (L-V 22:30 UTC).', 'info');
+        return;
+    }
+    const result = await apiPost('scan', {});
+    if (result && result.status === 'started') {
+        showToast('Escaneo iniciado... puede tardar unos minutos.', 'success');
+        pollScanStatus();
+    } else if (result && result.status === 'already_running') {
+        showToast('Ya hay un escaneo en curso.', 'info');
+    } else {
+        showToast('Error al iniciar el escaneo.', 'error');
+    }
 }
 
 async function checkScanStatus() {
-    const data = await api('api/scan_status.json');
+    const data = IS_LOCAL ? await apiGet('scan/status') : { running: false };
     if (!data) return;
 
     const dot = document.querySelector('.status-dot');
@@ -271,22 +700,113 @@ async function checkScanStatus() {
     if (data.running) {
         if (dot) dot.classList.add('running');
         if (text) text.textContent = 'Escaneando...';
-        if (btn) {
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner"></span> Escaneando...';
-        }
+        if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Escaneando...'; }
     } else {
         if (dot) dot.classList.remove('running');
-        if (text) text.textContent = 'En espera';
-        if (btn) {
-            btn.disabled = false;
-            btn.innerHTML = '<span class="btn-icon">⟳</span> Escanear Ahora';
-        }
+        if (text) text.textContent = IS_LOCAL ? 'Servidor activo' : 'En espera';
+        if (btn) { btn.disabled = false; btn.innerHTML = '<span class="btn-icon">⟳</span> Escanear Ahora'; }
     }
 }
 
 function pollScanStatus() {
-    // Disabled in static mode
+    const interval = setInterval(async () => {
+        const data = await apiGet('scan/status');
+        if (data && !data.running) {
+            clearInterval(interval);
+            showToast('Escaneo completado.', 'success');
+            loadAll();
+        }
+    }, 5000);
+}
+
+// ── Interactive Actions (Local only) ────────────────────────
+
+function openSellModal(positionId, symbol, shares, price) {
+    _sellPositionId = positionId;
+    setText('sell-symbol', symbol);
+    setText('sell-shares', shares);
+    setText('sell-price', `€${price.toFixed(2)}`);
+    document.getElementById('sell-type').value = 'full';
+    document.getElementById('partial-field').style.display = 'none';
+    document.getElementById('sell-modal').style.display = 'flex';
+}
+
+function togglePartialInput() {
+    const type = document.getElementById('sell-type').value;
+    document.getElementById('partial-field').style.display = type === 'partial' ? 'block' : 'none';
+}
+
+async function executeSell() {
+    const type = document.getElementById('sell-type').value;
+    const priceText = document.getElementById('sell-price').textContent.replace('€', '');
+    const price = parseFloat(priceText);
+    const data = { position_id: _sellPositionId, exit_price: price, sell_type: type };
+    if (type === 'partial') {
+        data.shares = parseInt(document.getElementById('sell-partial-shares').value);
+    }
+    const result = await apiPost('portfolio/sell', data);
+    closeModal('sell-modal');
+    if (result && result.status) {
+        showToast(`${result.symbol}: Vendido (${result.pnl_pct ? result.pnl_pct.toFixed(2) + '%' : 'OK'})`, result.pnl_pct >= 0 ? 'success' : 'error');
+        loadAll();
+    } else {
+        showToast('Error al vender.', 'error');
+    }
+}
+
+function openStopModal(positionId, symbol, currentStop) {
+    _stopPositionId = positionId;
+    setText('stop-symbol', symbol);
+    setText('stop-current', `€${currentStop.toFixed(2)}`);
+    document.getElementById('stop-new').value = currentStop.toFixed(2);
+    document.getElementById('stop-modal').style.display = 'flex';
+}
+
+async function executeStopChange() {
+    const newStop = parseFloat(document.getElementById('stop-new').value);
+    const result = await apiPost(`portfolio/${_stopPositionId}/stop`, { stop_price: newStop });
+    closeModal('stop-modal');
+    if (result && result.status === 'updated') {
+        showToast(`Stop actualizado a €${newStop.toFixed(2)}`, 'success');
+        loadAll();
+    } else {
+        showToast('Error al actualizar stop.', 'error');
+    }
+}
+
+async function deletePosition(positionId, symbol) {
+    if (!confirm(`¿Eliminar la posición de ${symbol}? (Se devuelve el capital invertido)`)) return;
+    const result = await apiDelete(`portfolio/${positionId}`);
+    if (result && result.status === 'deleted') {
+        showToast(`${symbol} eliminado.`, 'success');
+        loadAll();
+    } else {
+        showToast('Error al eliminar.', 'error');
+    }
+}
+
+function openCapitalModal() {
+    const cashEl = document.getElementById('stat-cash');
+    const current = cashEl ? cashEl.textContent : '€0.00';
+    setText('capital-current', current);
+    document.getElementById('capital-new').value = parseFloat(current.replace(/[^0-9.-]/g, '')) || 0;
+    document.getElementById('capital-modal').style.display = 'flex';
+}
+
+async function executeCapitalChange() {
+    const newCash = parseFloat(document.getElementById('capital-new').value);
+    const result = await apiPost('settings/capital', { cash: newCash });
+    closeModal('capital-modal');
+    if (result && result.status === 'updated') {
+        showToast(`Capital actualizado a ${formatCurrency(newCash)}`, 'success');
+        loadAll();
+    } else {
+        showToast('Error al actualizar capital.', 'error');
+    }
+}
+
+function closeModal(id) {
+    document.getElementById(id).style.display = 'none';
 }
 
 // ── Utilities ───────────────────────────────────────────────
@@ -297,16 +817,23 @@ function setText(id, value) {
 }
 
 function formatCurrency(value) {
-    if (value == null) return '$0.00';
+    if (value === null || value === undefined) return '$0.00';
     const sign = value < 0 ? '-' : '';
     const abs = Math.abs(value);
     return `${sign}$${abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function formatEUR(value) {
+    if (value === null || value === undefined) return '€0.00';
+    const sign = value < 0 ? '-' : '';
+    const abs = Math.abs(value);
+    return `${sign}€${abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 function pnlClass(value) {
     if (value > 0) return 'positive';
     if (value < 0) return 'negative';
-    return '';
+    return 'neutral';
 }
 
 function setupBadgeClass(setup) {
@@ -322,12 +849,10 @@ function setupBadgeClass(setup) {
 function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
     if (!container) return;
-
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.textContent = message;
     container.appendChild(toast);
-
     setTimeout(() => {
         toast.style.opacity = '0';
         toast.style.transform = 'translateY(16px)';
@@ -341,7 +866,7 @@ function showToast(message, type = 'info') {
 let equityChart = null;
 
 async function loadEquityCurve() {
-    const data = await api('api/equity.json');
+    const data = await apiGet('equity');
     const canvas = document.getElementById('equity-chart');
     const emptyMsg = document.getElementById('equity-empty');
     if (!canvas) return;
@@ -358,90 +883,52 @@ async function loadEquityCurve() {
     const labels = data.map(d => d.snap_date);
     const equityValues = data.map(d => d.total_equity);
     const initialCapital = equityValues.length > 0 ? equityValues[0] : 10000;
-
-    // Determine gradient colors based on last vs first
     const lastVal = equityValues[equityValues.length - 1];
     const isPositive = lastVal >= initialCapital;
 
-    if (equityChart) {
-        equityChart.destroy();
-    }
+    if (equityChart) equityChart.destroy();
 
     const ctx = canvas.getContext('2d');
     const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height * 2);
-    if (isPositive) {
-        gradient.addColorStop(0, 'rgba(63, 185, 80, 0.3)');
-        gradient.addColorStop(1, 'rgba(63, 185, 80, 0.0)');
-    } else {
-        gradient.addColorStop(0, 'rgba(248, 81, 73, 0.3)');
-        gradient.addColorStop(1, 'rgba(248, 81, 73, 0.0)');
-    }
+    gradient.addColorStop(0, isPositive ? 'rgba(63, 185, 80, 0.3)' : 'rgba(248, 81, 73, 0.3)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
 
     equityChart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: labels,
+            labels,
             datasets: [{
-                label: 'Equity',
-                data: equityValues,
+                label: 'Equity', data: equityValues,
                 borderColor: isPositive ? '#3fb950' : '#f85149',
-                backgroundColor: gradient,
-                borderWidth: 2,
-                fill: true,
-                tension: 0.3,
-                pointRadius: data.length > 30 ? 0 : 3,
-                pointHoverRadius: 5,
+                backgroundColor: gradient, borderWidth: 2, fill: true, tension: 0.3,
+                pointRadius: data.length > 30 ? 0 : 3, pointHoverRadius: 5,
             }]
         },
         options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: {
-                intersect: false,
-                mode: 'index',
-            },
+            responsive: true, maintainAspectRatio: false,
+            interaction: { intersect: false, mode: 'index' },
             plugins: {
                 legend: { display: false },
-                tooltip: {
-                    callbacks: {
-                        label: function(ctx) {
-                            const val = ctx.raw;
-                            const ret = ((val / initialCapital - 1) * 100).toFixed(2);
-                            return `$${val.toLocaleString('en-US', {minimumFractionDigits: 2})} (${ret >= 0 ? '+' : ''}${ret}%)`;
-                        }
-                    }
-                }
+                tooltip: { callbacks: { label: ctx => {
+                    const val = ctx.raw;
+                    const ret = ((val / initialCapital - 1) * 100).toFixed(2);
+                    return `$${val.toLocaleString('en-US', {minimumFractionDigits: 2})} (${ret >= 0 ? '+' : ''}${ret}%)`;
+                }}}
             },
             scales: {
-                x: {
-                    grid: { color: 'rgba(48, 54, 61, 0.5)' },
-                    ticks: {
-                        color: '#8b949e',
-                        maxTicksLimit: 10,
-                        font: { size: 10 },
-                    }
-                },
-                y: {
-                    grid: { color: 'rgba(48, 54, 61, 0.5)' },
-                    ticks: {
-                        color: '#8b949e',
-                        callback: function(value) {
-                            return '$' + value.toLocaleString();
-                        },
-                        font: { size: 10 },
-                    }
-                }
+                x: { grid: { color: 'rgba(48,54,61,0.5)' }, ticks: { color: '#8b949e', maxTicksLimit: 10, font: { size: 10 } } },
+                y: { grid: { color: 'rgba(48,54,61,0.5)' }, ticks: { color: '#8b949e', callback: v => '$' + v.toLocaleString(), font: { size: 10 } } }
             }
         }
     });
 }
 
-// ── Analytics Forward Returns Chart ──────────────────────────
+// ── Analytics Chart ────────────────────────────────────────
 
 let analyticsChart = null;
 
 async function loadAnalytics() {
-    const data = await api('api/analytics.json');
+    const data = await apiGet('analytics');
     const canvas = document.getElementById('analytics-chart');
     const emptyMsg = document.getElementById('analytics-empty');
     if (!canvas) return;
@@ -457,80 +944,39 @@ async function loadAnalytics() {
 
     setText('stat-signals-evaluated', data.length);
 
-    let mfeSum = 0;
-    let maeSum = 0;
-    let hits = 0;
-
+    let mfeSum = 0, maeSum = 0, hits = 0;
     const setupStats = {};
 
     data.forEach(d => {
         mfeSum += d.mfe_pct;
         maeSum += d.mae_pct;
-        const isHit = d.mfe_pct >= 0.10; // Hit if it goes +10% 
-        if (isHit) hits++;
-
-        if (!setupStats[d.setup_type]) {
-            setupStats[d.setup_type] = { count: 0, hits: 0 };
-        }
+        if (d.mfe_pct >= 0.10) hits++;
+        if (!setupStats[d.setup_type]) setupStats[d.setup_type] = { count: 0, hits: 0 };
         setupStats[d.setup_type].count++;
-        if (isHit) setupStats[d.setup_type].hits++;
+        if (d.mfe_pct >= 0.10) setupStats[d.setup_type].hits++;
     });
 
-    const avgMfe = (mfeSum / data.length) * 100;
-    const avgMae = (maeSum / data.length) * 100;
-    const hitRate = (hits / data.length) * 100;
-
-    setText('stat-mfe-avg', `+${avgMfe.toFixed(2)}%`);
-    setText('stat-mae-avg', `${avgMae.toFixed(2)}%`);
-    setText('stat-hit-rate', `${hitRate.toFixed(1)}%`);
+    setText('stat-mfe-avg', `+${(mfeSum / data.length * 100).toFixed(2)}%`);
+    setText('stat-mae-avg', `${(maeSum / data.length * 100).toFixed(2)}%`);
+    setText('stat-hit-rate', `${(hits / data.length * 100).toFixed(1)}%`);
 
     const labels = Object.keys(setupStats);
     const chartData = labels.map(l => (setupStats[l].hits / setupStats[l].count) * 100);
 
-    if (analyticsChart) {
-        analyticsChart.destroy();
-    }
+    if (analyticsChart) analyticsChart.destroy();
 
-    const ctx = canvas.getContext('2d');
-    analyticsChart = new Chart(ctx, {
+    analyticsChart = new Chart(canvas.getContext('2d'), {
         type: 'bar',
         data: {
             labels: labels.map(l => l.toUpperCase()),
-            datasets: [{
-                label: 'Hit Rate (>10% MFE)',
-                data: chartData,
-                backgroundColor: 'rgba(63, 185, 80, 0.8)',
-                borderRadius: 4,
-            }]
+            datasets: [{ label: 'Hit Rate (>10% MFE)', data: chartData, backgroundColor: 'rgba(63, 185, 80, 0.8)', borderRadius: 4 }]
         },
         options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: { display: false },
-                tooltip: {
-                    callbacks: {
-                        label: function(ctx) {
-                            return ctx.raw.toFixed(1) + '%';
-                        }
-                    }
-                }
-            },
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ctx.raw.toFixed(1) + '%' } } },
             scales: {
-                y: {
-                    beginAtZero: true,
-                    max: 100,
-                    grid: { color: 'rgba(48, 54, 61, 0.5)' },
-                    ticks: {
-                        color: '#8b949e',
-                        font: { size: 10 },
-                        callback: function(value) { return value + '%'; }
-                    }
-                },
-                x: {
-                    grid: { display: false },
-                    ticks: { color: '#8b949e', font: { size: 11, weight: 'bold' } }
-                }
+                y: { beginAtZero: true, max: 100, grid: { color: 'rgba(48,54,61,0.5)' }, ticks: { color: '#8b949e', font: { size: 10 }, callback: v => v + '%' } },
+                x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 11, weight: 'bold' } } }
             }
         }
     });
