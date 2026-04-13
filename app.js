@@ -5,9 +5,13 @@
 
 const REFRESH_INTERVAL = 30000;
 let refreshTimer = null;
-let IS_LOCAL = false;
+let IS_LOCAL = window.IS_LOCAL = false;
 let _sellPositionId = null;
 let _stopPositionId = null;
+let _stopPositionShares = 0;
+let _stopPositionEntry = 0;
+let _equityEur = 0;
+let _fxRate = 1.0;
 
 // ── Initialization ──────────────────────────────────────────
 
@@ -21,7 +25,8 @@ async function detectMode() {
     const isLocal = location.hostname === 'localhost' 
         || location.hostname === '127.0.0.1' 
         || location.hostname.startsWith('192.168.')
-        || location.hostname.startsWith('10.');
+        || location.hostname.startsWith('10.')
+        || location.hostname.startsWith('172.');
     IS_LOCAL = isLocal;
     
     if (IS_LOCAL) {
@@ -42,6 +47,8 @@ function loadAll() {
     loadHistory();
     loadEquityCurve();
     loadAnalytics();
+    loadWatchlist();
+    loadNotifications();
     checkScanStatus();
     updateTimestamp();
 }
@@ -103,6 +110,10 @@ async function loadStats() {
     const stats = await apiGet('stats');
     if (!stats) return;
 
+    // Store globally for risk calculations in position cards and stop modal
+    _equityEur = stats.total_equity || 0;
+    _fxRate = stats.fx_rate || 1.0;
+
     setText('stat-equity', formatEUR(stats.total_equity));
     setText('stat-cash', formatEUR(stats.cash));
 
@@ -122,6 +133,14 @@ async function loadStats() {
     setText('stat-winrate', `${(stats.win_rate || 0).toFixed(0)}%`);
     setText('stat-ravg', `${(stats.avg_r_multiple || 0).toFixed(1)}R`);
     setText('stat-trades', stats.total_trades || 0);
+
+    // Risk summary
+    const riskEl = document.getElementById('stat-risk');
+    if (riskEl) {
+        const riskPct = stats.risk_pct || 0;
+        riskEl.textContent = `$${(stats.total_risk_usd || 0).toFixed(0)} (${riskPct.toFixed(1)}%)`;
+        riskEl.className = 'stat-value ' + (riskPct > 5 ? 'negative' : riskPct > 3 ? 'warning' : 'positive');
+    }
 }
 
 // ── Pending Actions (Copilot) ───────────────────────────────
@@ -185,12 +204,74 @@ async function loadPendingActions() {
 }
 
 async function approvePendingAction(id, symbol) {
+    // Fetch the pending action details to check if it has valid sizing
+    const actions = await apiGet('pending');
+    const action = actions ? actions.find(a => a.id === id) : null;
+
+    if (action && action.action_type === 'BUY' && (action.shares <= 0 || action.price <= 0)) {
+        // Missing sizing — fetch it and show modal, then approve after confirm
+        showToast('Calculando sizing...', 'info');
+        const sizing = await apiGet(`sizing/${symbol}?setup_type=${action.setup_type || 'breakout'}&score=0.8`);
+        if (!sizing || sizing.error) {
+            showToast(sizing?.error || 'Error calculando sizing', 'error');
+            return;
+        }
+        // Reject the old incomplete action and create a proper one via modal
+        await apiPost(`pending/${id}/reject`, {});
+        showSizingModal(symbol, action.setup_type || 'breakout', sizing);
+        return;
+    }
+
+    // Action has valid data — show review modal for BUY actions
+    if (action && action.action_type === 'BUY' && action.shares > 0 && action.price > 0) {
+        const fxRate = action.fx_rate || 1.0;
+        showSizingModal(symbol, action.setup_type || 'breakout', {
+            shares: action.shares,
+            entry_price: action.price,
+            stop_price: action.stop_price,
+            fx_rate: fxRate,
+            cost_usd: action.shares * action.price,
+            cost_eur: (action.shares * action.price) / fxRate,
+            risk_amount_usd: action.shares * (action.price - action.stop_price),
+        });
+        // Override the confirm button to approve instead of creating new pending
+        document.getElementById('sizing-confirm-btn').onclick = async () => {
+            const shares = parseInt(document.getElementById('sizing-shares').value) || 0;
+            const stopFromInput = parseFloat(document.getElementById('sizing-stop').value) || action.stop_price;
+            if (shares !== action.shares || true) {
+                // User may have adjusted shares/stop — reject old, create new with correct values
+                await apiPost(`pending/${id}/reject`, {});
+                const result = await apiPost('pending', {
+                    symbol, action_type: 'BUY', setup_type: action.setup_type,
+                    reason: action.reason || `Compra manual (${(action.setup_type || '').toUpperCase()})`,
+                    shares: shares, price: action.price, stop_price: stopFromInput,
+                });
+                if (result && result.id) {
+                    const approveRes = await apiPost(`pending/${result.id}/approve`, {});
+                    closeModal('sizing-modal');
+                    if (approveRes && approveRes.status === 'approved') {
+                        showToast(`Compra aprobada: ${symbol} x${shares}`, 'success');
+                    } else {
+                        showToast(approveRes?.error || `Error al aprobar ${symbol}`, 'error');
+                    }
+                } else {
+                    closeModal('sizing-modal');
+                    showToast('Error creando accion', 'error');
+                }
+            }
+            _sizingData = null;
+            loadAll();
+        };
+        return;
+    }
+
+    // Non-BUY actions: approve directly
     const res = await apiPost(`pending/${id}/approve`, {});
     if (res && res.status === 'approved') {
-        showToast(`Acción aprobada para ${symbol}`, 'success');
+        showToast(`Accion aprobada para ${symbol}`, 'success');
         loadAll();
     } else {
-        showToast(`Error al aprobar ${symbol}`, 'error');
+        showToast(res?.error || `Error al aprobar ${symbol}`, 'error');
     }
 }
 
@@ -221,6 +302,9 @@ async function loadPositions() {
         return;
     }
 
+    // Populate global map for chart modal access
+    positions.forEach(pos => { _positionMap[pos.id] = pos; });
+
     body.innerHTML = positions.map(pos => {
         const pnl = pos.pnl_pct || 0;
         const rec = pos.recommendation || 'HOLD';
@@ -243,14 +327,26 @@ async function loadPositions() {
         const invested = (pos.entry_price || 0) * shares;
         const pnlAbs = pos.pnl_abs || ((pos.last_close || 0) - (pos.entry_price || 0)) * shares;
 
-        // Action buttons (only in local mode)
+        // Risk calculation for this position
+        const stopPrice = pos.current_stop || pos.initial_stop || 0;
+        const riskUsd = Math.max(0, (pos.entry_price - stopPrice) * shares);
+        const stopDistPct = pos.entry_price > 0 ? ((pos.entry_price - stopPrice) / pos.entry_price * 100) : 0;
+        const equityUsd = _equityEur * _fxRate;
+        const riskAccPct = equityUsd > 0 ? (riskUsd / equityUsd * 100) : null;
+        const riskLabel = riskAccPct !== null
+            ? `$${riskUsd.toFixed(0)} · ${riskAccPct.toFixed(2)}%`
+            : `$${riskUsd.toFixed(0)} · ${stopDistPct.toFixed(1)}%↓`;
+
+        // Action buttons
+        const chartBtn = `<button class="btn-action btn-action-chart" onclick="openChartModal('${pos.symbol}', null, _positionMap[${pos.id}])">📈 Gráfico / IA</button>`;
         const actions = IS_LOCAL ? `
             <div class="pos-actions">
+                ${chartBtn}
                 <button class="btn-action btn-action-sell" onclick="openSellModal(${pos.id}, '${pos.symbol}', ${shares}, ${pos.last_close || pos.entry_price})">🔴 Vender</button>
-                <button class="btn-action btn-action-edit" onclick="openStopModal(${pos.id}, '${pos.symbol}', ${pos.current_stop || 0})">✏️ Stop</button>
+                <button class="btn-action btn-action-edit" onclick="openStopModal(${pos.id}, '${pos.symbol}', ${stopPrice}, ${shares}, ${pos.entry_price || 0})">✏️ Stop</button>
                 <button class="btn-action btn-action-delete" onclick="deletePosition(${pos.id}, '${pos.symbol}')">🗑️</button>
             </div>
-        ` : '';
+        ` : `<div class="pos-actions">${chartBtn}</div>`;
 
         return `
             <div class="position-card">
@@ -264,7 +360,7 @@ async function loadPositions() {
                         <div style="font-size:12px;font-family:var(--font-mono);color:var(--text-muted)">${formatCurrency(pnlAbs)}</div>
                     </div>
                 </div>
-                <div class="pos-details" style="grid-template-columns:repeat(6,1fr)">
+                <div class="pos-details" style="grid-template-columns:repeat(7,1fr)">
                     <div class="pos-detail">
                         <div class="pos-detail-label">Fecha</div>
                         <div class="pos-detail-value">${entryDate}</div>
@@ -283,7 +379,11 @@ async function loadPositions() {
                     </div>
                     <div class="pos-detail">
                         <div class="pos-detail-label">Stop</div>
-                        <div class="pos-detail-value" style="color:var(--negative)">$${(pos.current_stop || 0).toFixed(2)}</div>
+                        <div class="pos-detail-value" style="color:var(--negative)">$${stopPrice.toFixed(2)}</div>
+                    </div>
+                    <div class="pos-detail">
+                        <div class="pos-detail-label">Riesgo</div>
+                        <div class="pos-detail-value" style="color:var(--negative)">${riskLabel}</div>
                     </div>
                     <div class="pos-detail">
                         <div class="pos-detail-label">Dias</div>
@@ -314,34 +414,61 @@ async function loadSignals() {
         allSignals = allSignals.filter(sig => sig.setup_type && sig.setup_type.toLowerCase() === setupType);
     }
 
-    allSignals.sort((a, b) => {
-        const statusA = a.status || 'near';
-        const statusB = b.status || 'near';
-        if (statusA === statusB) return (b.score || 0) - (a.score || 0);
-        return statusA === 'ready' ? -1 : 1;
+    // Group signals by symbol — same stock can have EP + Breakout simultaneously
+    const symbolMap = {};
+    allSignals.forEach(sig => {
+        if (!symbolMap[sig.symbol]) symbolMap[sig.symbol] = [];
+        // Avoid duplicating same setup_type
+        if (!symbolMap[sig.symbol].some(s => s.setup_type === sig.setup_type)) {
+            symbolMap[sig.symbol].push(sig);
+        }
     });
+
+    // Store globally for openChartModal to access
+    Object.assign(_signalGroups, symbolMap);
+
+    // Sort groups: composite score = ready(+2.0) + bestScore(0–1) + multi(+0.3)
+    // READY always beats NEAR regardless of multi-setup
+    const groups = Object.entries(symbolMap).map(([symbol, signals]) => {
+        const hasReady = signals.some(s => s.status === 'ready');
+        const bestScore = Math.max(...signals.map(s => s.score || 0));
+        const isMulti = signals.length > 1;
+        const composite = (hasReady ? 2.0 : 0.0) + bestScore + (isMulti ? 0.3 : 0.0);
+        return { symbol, signals, hasReady, bestScore, isMulti, composite };
+    }).sort((a, b) => b.composite - a.composite);
 
     const body = document.getElementById('signals-body');
     if (!body) return;
 
-    if (allSignals.length === 0) {
+    if (groups.length === 0) {
         body.innerHTML = '<div class="empty-state">Sin señales detectadas</div>';
         return;
     }
 
-    body.innerHTML = allSignals.map(sig => {
-        const status = sig.status || 'near';
-        const score = (sig.score || 0) * 100;
-        const guidance = Array.isArray(sig.guidance) ? sig.guidance : [];
-        const guidanceText = guidance.slice(0, 2).join(' · ');
-        const scanDate = sig.scan_date ? `<span style="font-size:10px;color:var(--text-dim);margin-left:6px">${sig.scan_date}</span>` : '';
+    body.innerHTML = groups.map(({ symbol, signals, hasReady, bestScore, isMulti }) => {
+        const score = bestScore * 100;
+        const status = hasReady ? 'ready' : 'near';
+
+        // Combine guidance from all signals (deduplicated)
+        const allGuidance = [...new Set(signals.flatMap(s => Array.isArray(s.guidance) ? s.guidance : []))];
+        const guidanceText = allGuidance.slice(0, 2).join(' · ');
+
+        const scanDate = signals[0]?.scan_date
+            ? `<span style="font-size:10px;color:var(--text-dim);margin-left:6px">${signals[0].scan_date}</span>`
+            : '';
+
+        const multiBadge = isMulti
+            ? `<span class="badge" style="background:rgba(251,191,36,0.2);color:#fbbf24;margin-left:4px;font-weight:bold;">⚡ MULTI-SETUP</span>`
+            : '';
 
         return `
-            <div class="signal-card ${status}">
+            <div class="signal-card ${status}" style="${isMulti ? 'border-left:3px solid #fbbf24;' : ''}"
+                 onclick="openChartModal('${symbol}')" style="cursor:pointer;">
                 <div class="signal-left">
-                    <span class="signal-symbol" style="cursor:pointer;text-decoration:underline;" onclick="openChartModal('${sig.symbol}', '${sig.setup_type}')">${sig.symbol}</span>
-                    <span class="badge ${setupBadgeClass(sig.setup_type)}">${sig.setup_type}</span>
+                    <span class="signal-symbol" style="cursor:pointer;text-decoration:underline;">${symbol}</span>
+                    ${signals.map(s => `<span class="badge ${setupBadgeClass(s.setup_type)}">${s.setup_type.toUpperCase()}</span>`).join('')}
                     ${status === 'ready' ? '<span class="badge badge-hold">READY</span>' : '<span class="badge badge-watch">NEAR</span>'}
+                    ${multiBadge}
                     ${scanDate}
                 </div>
                 <div class="signal-right">
@@ -357,6 +484,7 @@ let chartState = {
     symbol: '',
     period: '365d',
     setupType: '',
+    signals: [],   // array of signal objects for current symbol
     data: [],
     charts: { main: null, vol: null, rsi: null, macd: null, stoch: null },
     series: {},
@@ -368,24 +496,96 @@ let chartState = {
 };
 
 let _currentSignal = null;
+let _currentPositionData = null;  // populated when chart opened from a position
+const _signalGroups = {};  // symbol -> [signalObjects] — populated by loadSignals()
+const _positionMap = {};   // id -> position object — populated by loadPositions()
 
-async function openChartModal(symbol, setupType, signalData) {
+async function openChartModal(symbol, signalsOrSetup, positionData = null) {
     const modal = document.getElementById('chart-modal');
     if (!modal) return;
     modal.style.display = 'flex';
-    
-    document.getElementById('chart-modal-title').textContent = `${symbol} — ${setupType.toUpperCase()}`;
-    
+
+    // Store position context globally
+    _currentPositionData = positionData || null;
+
+    // Resolve signals: from _signalGroups map, passed array, or legacy string
+    let signals = [];
+    if (signalsOrSetup === undefined || signalsOrSetup === null) {
+        signals = _signalGroups[symbol] || [];
+    } else if (typeof signalsOrSetup === 'string') {
+        signals = [{ symbol, setup_type: signalsOrSetup }];
+    } else if (Array.isArray(signalsOrSetup)) {
+        signals = signalsOrSetup;
+    }
+
     chartState.symbol = symbol;
-    chartState.setupType = setupType;
-    _currentSignal = signalData || { symbol, setup_type: setupType };
-    
-    document.getElementById('chart-btn-buy').onclick = () => confirmSignalFromChart(symbol, setupType);
-    document.getElementById('chart-btn-wait').onclick = () => {
-        showToast(`${symbol} marcado para seguimiento`, 'info');
-        hideChartModal();
-    };
-    document.getElementById('chart-btn-discard').onclick = () => hideChartModal();
+    chartState.signals = signals;
+
+    const setupTypes = signals.map(s => s.setup_type).filter(Boolean);
+    const primarySetup = setupTypes[0] || (positionData ? positionData.setup_type : 'breakout');
+
+    // Position mode: show position info bar, hide signal-only buttons
+    const posInfoEl  = document.getElementById('chart-position-info');
+    const btnBuy     = document.getElementById('chart-btn-buy');
+    const btnWait    = document.getElementById('chart-btn-wait');
+    const btnDiscard = document.getElementById('chart-btn-discard');
+
+    if (positionData) {
+        const pnl = positionData.pnl_pct || 0;
+        const pnlColor = pnl >= 0 ? '#4ade80' : '#f87171';
+        const days = positionData.entry_date
+            ? Math.max(0, Math.floor((Date.now() - new Date(positionData.entry_date + 'T12:00:00').getTime()) / 86400000))
+            : 0;
+        posInfoEl.style.display = 'flex';
+        posInfoEl.innerHTML = `
+            <span style="color:#94a3b8">📌 POSICIÓN ABIERTA</span>
+            <span>Entrada: <strong>$${(positionData.entry_price || 0).toFixed(2)}</strong></span>
+            <span>Actual: <strong>$${(positionData.last_close || 0).toFixed(2)}</strong></span>
+            <span>P&L: <strong style="color:${pnlColor}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</strong></span>
+            <span>Stop: <strong style="color:#f87171">$${(positionData.current_stop || 0).toFixed(2)}</strong></span>
+            <span>Días: <strong>${days}</strong></span>
+        `;
+        document.getElementById('chart-modal-title').textContent = `${symbol} — ${(positionData.setup_type || 'POSICIÓN').toUpperCase()} (Posición)`;
+        if (btnBuy)     btnBuy.style.display     = 'none';
+        if (btnWait)    btnWait.style.display    = 'none';
+        if (btnDiscard) btnDiscard.style.display = 'none';
+    } else {
+        posInfoEl.style.display = 'none';
+        const setupLabel = setupTypes.length > 0 ? setupTypes.map(s => s.toUpperCase()).join(' + ') : 'CHART';
+        document.getElementById('chart-modal-title').textContent = `${symbol} — ${setupLabel}`;
+        if (btnBuy)     btnBuy.style.display     = '';
+        if (btnWait)    btnWait.style.display    = '';
+        if (btnDiscard) btnDiscard.style.display = '';
+        document.getElementById('chart-btn-buy').onclick = () => confirmSignalFromChart(symbol, primarySetup);
+        document.getElementById('chart-btn-wait').onclick = () => {
+            addToWatchlist(symbol, `Desde grafico (${setupLabel})`);
+            showToast(`${symbol} agregado a watchlist`, 'info');
+            hideChartModal();
+        };
+        document.getElementById('chart-btn-discard').onclick = () => hideChartModal();
+    }
+
+    _currentSignal = signals[0] || { symbol, setup_type: primarySetup };
+
+    // Reset Copilot UI
+    const copilotArea    = document.getElementById('chart-copilot-area');
+    const copilotBtn     = document.getElementById('chart-btn-copilot');
+    const resumenEl      = document.getElementById('copilot-resumen');
+    const historyBtn     = document.getElementById('copilot-history-btn');
+    const historyArea    = document.getElementById('copilot-history-area');
+    if (copilotArea)  copilotArea.style.display  = 'none';
+    if (resumenEl)    resumenEl.style.display    = 'none';
+    if (historyBtn)   historyBtn.style.display   = 'none';
+    if (historyArea)  historyArea.style.display  = 'none';
+    if (copilotBtn) {
+        copilotBtn.innerHTML = '🧠 Analizar con IA';
+        copilotBtn.disabled = false;
+        if (positionData) {
+            copilotBtn.onclick = () => requestCopilotAnalysis(symbol, [positionData.setup_type || 'general'], positionData.id);
+        } else {
+            copilotBtn.onclick = () => requestCopilotAnalysis(symbol, setupTypes);
+        }
+    }
 
     await loadChartData();
 }
@@ -410,6 +610,167 @@ async function loadChartData() {
     chartState.data = data;
     renderCharts();
 }
+
+async function requestCopilotAnalysis(symbol, setupTypes, positionId = null) {
+    const btn = document.getElementById('chart-btn-copilot');
+    const area = document.getElementById('chart-copilot-area');
+    const decisionEl = document.getElementById('copilot-decision');
+    const valoracionEl = document.getElementById('copilot-valoracion');
+    const confianzaEl = document.getElementById('copilot-confianza');
+    const resumenEl = document.getElementById('copilot-resumen');
+    const historyBtn = document.getElementById('copilot-history-btn');
+
+    if (!btn || !area) return;
+
+    const isPositionMode = !!positionId;
+    const types = Array.isArray(setupTypes) ? setupTypes : (setupTypes ? [setupTypes] : []);
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Consultando a la IA...';
+    area.style.display = 'block';
+    if (resumenEl) resumenEl.style.display = 'none';
+    if (historyBtn) historyBtn.style.display = 'none';
+    decisionEl.textContent = 'ESPERANDO';
+    decisionEl.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+    decisionEl.style.color = '#fff';
+    valoracionEl.textContent = isPositionMode
+        ? 'Evaluando la posición según las reglas de gestión de Qullamaggie...'
+        : 'El Copiloto está analizando el contexto, métricas y la estructura de precios según las reglas de Qullamaggie. Por favor espera...';
+    confianzaEl.textContent = '-';
+
+    try {
+        const body = { symbol, setup_types: types };
+        if (positionId) body.position_id = positionId;
+
+        const res = await fetch('/api/copilot/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+
+        btn.innerHTML = '🧠 Re-analizar';
+        btn.disabled = false;
+
+        if (!res.ok) throw new Error('Error en la API');
+        const data = await res.json();
+
+        const confianzaNum = parseInt((data.confianza || '0%').replace('%', '')) || 0;
+        valoracionEl.textContent = data.valoracion || 'Sin valoración';
+        confianzaEl.textContent = data.confianza || '0%';
+
+        const decisionText = (data.decision || '').trim().toUpperCase();
+        decisionEl.textContent = decisionText;
+
+        if (isPositionMode) {
+            // Position mode: color by MANTENER/VENDER/AÑADIR/REDUCIR
+            const colors = {
+                'MANTENER': ['rgba(59,130,246,0.2)', '#60a5fa'],
+                'AÑADIR':   ['rgba(34,197,94,0.2)',  '#4ade80'],
+                'REDUCIR':  ['rgba(234,179,8,0.2)',  '#facc15'],
+                'VENDER':   ['rgba(239,68,68,0.2)',  '#f87171'],
+            };
+            const [bg, color] = colors[decisionText] || ['rgba(234,179,8,0.2)', '#facc15'];
+            decisionEl.style.backgroundColor = bg;
+            decisionEl.style.color = color;
+
+            // Show "Ver historial IA" button for positions
+            if (historyBtn) {
+                historyBtn.style.display = 'flex';
+                historyBtn.onclick = () => loadPositionCopilotHistory(positionId);
+            }
+        } else {
+            // Signal mode: INVERTIR/NO INVERTIR colors
+            if (decisionText === 'INVERTIR') {
+                decisionEl.style.backgroundColor = 'rgba(34, 197, 94, 0.2)';
+                decisionEl.style.color = '#4ade80';
+            } else if (decisionText === 'NO INVERTIR') {
+                decisionEl.style.backgroundColor = 'rgba(239, 68, 68, 0.2)';
+                decisionEl.style.color = '#f87171';
+            } else {
+                decisionEl.style.backgroundColor = 'rgba(234, 179, 8, 0.2)';
+                decisionEl.style.color = '#facc15';
+            }
+        }
+
+        // Resumen banner (both modes)
+        if (resumenEl && data.resumen) {
+            const resumenText = data.resumen.trim();
+            const upper = resumenText.toUpperCase();
+            resumenEl.textContent = resumenText;
+            resumenEl.style.display = 'block';
+            if (upper.startsWith('COMPRAR') || upper.startsWith('AÑADIR') || upper.startsWith('MANTENER')) {
+                resumenEl.style.background = 'rgba(16,185,129,0.1)';
+                resumenEl.style.borderColor = '#10b981';
+                resumenEl.style.color = '#4ade80';
+            } else if (upper.startsWith('ESPERAR') || upper.startsWith('REDUCIR')) {
+                resumenEl.style.background = 'rgba(234,179,8,0.1)';
+                resumenEl.style.borderColor = '#f59e0b';
+                resumenEl.style.color = '#facc15';
+            } else {
+                resumenEl.style.background = 'rgba(239,68,68,0.1)';
+                resumenEl.style.borderColor = '#ef4444';
+                resumenEl.style.color = '#f87171';
+            }
+        }
+
+        // Show sizing only for signal mode with INVERTIR + confidence
+        if (!isPositionMode && data.sizing && confianzaNum > 0 && decisionText === 'INVERTIR') {
+            const s = data.sizing;
+            const primarySetup = types[0] || 'breakout';
+            let sizingHtml = `<div style="margin-top:10px;padding:8px 12px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3);border-radius:6px;font-size:12px;">`;
+            sizingHtml += `<strong>Sizing:</strong> ${s.shares} accs @ $${s.entry_price.toFixed(2)} | Stop: $${s.stop_price.toFixed(2)} | Riesgo: $${s.risk_amount_usd.toFixed(2)} | Coste: $${s.cost_usd.toFixed(2)} (€${s.cost_eur.toFixed(2)})`;
+            sizingHtml += ` <button onclick="showSizingModal('${symbol}','${primarySetup}',${JSON.stringify(s).replace(/"/g, '&quot;')})" style="margin-left:8px;padding:4px 10px;background:var(--positive);color:#000;border:none;border-radius:4px;cursor:pointer;font-weight:bold;font-size:11px;">Comprar ${s.shares} accs</button>`;
+            sizingHtml += `</div>`;
+            valoracionEl.innerHTML = valoracionEl.textContent + sizingHtml;
+        }
+
+    } catch (err) {
+        btn.innerHTML = '🧠 Re-analizar';
+        btn.disabled = false;
+        valoracionEl.textContent = 'Error al contactar con el Copiloto IA: ' + err.message;
+        decisionEl.textContent = 'ERROR';
+    }
+}
+
+async function loadPositionCopilotHistory(positionId) {
+    const historyArea = document.getElementById('copilot-history-area');
+    const historyList = document.getElementById('copilot-history-list');
+    const historyBtn  = document.getElementById('copilot-history-btn');
+    if (!historyArea || !historyList) return;
+
+    historyList.innerHTML = '<div style="color:#94a3b8;font-size:12px;padding:4px 0">Cargando...</div>';
+    historyArea.style.display = 'block';
+    if (historyBtn) historyBtn.style.display = 'none';
+
+    const history = await apiGet(`position/${positionId}/copilot_history`);
+    if (!history || history.length === 0) {
+        historyList.innerHTML = '<div style="color:#64748b;font-size:12px;padding:4px 0">Sin análisis previos.</div>';
+        return;
+    }
+
+    const decisionColors = {
+        'MANTENER': '#60a5fa', 'AÑADIR': '#4ade80', 'REDUCIR': '#facc15',
+        'VENDER': '#f87171', 'INVERTIR': '#4ade80', 'NO INVERTIR': '#f87171',
+    };
+
+    historyList.innerHTML = history.map(h => {
+        const color = decisionColors[h.decision] || '#94a3b8';
+        const ts = h.ts ? h.ts.replace('T', ' ').substring(0, 16) : '';
+        const mode = h.analysis_mode === 'position' ? '📊' : '🔍';
+        return `
+            <div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.05); font-size:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3px;">
+                    <span style="color:#94a3b8">${mode} ${ts}</span>
+                    <span style="color:${color}; font-weight:bold;">${h.decision}</span>
+                    <span style="color:#64748b">${h.confianza}</span>
+                </div>
+                ${h.resumen ? `<div style="color:#94a3b8; font-style:italic;">${h.resumen}</div>` : ''}
+            </div>
+        `;
+    }).join('');
+}
+
+
 
 function renderCharts() {
     Object.values(chartState.charts).forEach(c => { if(c) { try{c.remove()}catch(e){} } });
@@ -447,7 +808,31 @@ function renderCharts() {
         wickUpColor: '#10b981', wickDownColor: '#ef4444'
     });
     candleSeries.setData(data.map(d => ({time: d.time, open: d.open, high: d.high, low: d.low, close: d.close})));
-    
+
+    // Signal markers — one per detected setup, colored by type
+    const signalMarkerColors = {
+        'ep':        '#f59e0b',
+        'breakout':  '#10b981',
+        'vcp':       '#3b82f6',
+        'parabolic': '#ef4444',
+    };
+    const signals = chartState.signals || [];
+    if (signals.length > 0) {
+        const markers = signals
+            .filter(s => s.scan_date)
+            .map(s => ({
+                time: s.scan_date,
+                position: 'belowBar',
+                color: signalMarkerColors[s.setup_type] || '#8b5cf6',
+                shape: 'arrowUp',
+                text: s.setup_type ? s.setup_type.toUpperCase() : '',
+            }))
+            .sort((a, b) => a.time < b.time ? -1 : 1);
+        if (markers.length > 0) {
+            try { candleSeries.setMarkers(markers); } catch(e) {}
+        }
+    }
+
     // Moving Averages
     const addMA = (key, color, width, style) => {
         const sData = data.filter(d => d[key] != null).map(d => ({time: d.time, value: d[key]}));
@@ -616,19 +1001,116 @@ function hideChartModal() {
     chartState.charts = { main: null, vol: null, rsi: null, macd: null, stoch: null };
 }
 
+let _sizingData = null;
+
 async function confirmSignalFromChart(symbol, setupType) {
+    showToast('Calculando sizing...', 'info');
+    const sizing = await apiGet(`sizing/${symbol}?setup_type=${setupType}&score=0.8`);
+    if (!sizing || sizing.error) {
+        showToast(sizing?.error || 'Error calculando sizing', 'error');
+        return;
+    }
+    showSizingModal(symbol, setupType, sizing);
+}
+
+function showSizingModal(symbol, setupType, sizing) {
+    _sizingData = { symbol, setupType, ...sizing };
+
+    setText('sizing-symbol', symbol);
+    setText('sizing-setup', setupType.toUpperCase());
+    setText('sizing-price', `$${sizing.entry_price.toFixed(2)}`);
+
+    const stopInput = document.getElementById('sizing-stop');
+    stopInput.value = sizing.stop_price.toFixed(2);
+
+    const riskPctInput = document.getElementById('sizing-risk-pct');
+    riskPctInput.value = (sizing.risk_pct != null ? sizing.risk_pct : 1.0).toFixed(1);
+    riskPctInput.disabled = !sizing.equity_usd;
+    riskPctInput.title = sizing.equity_usd ? '' : 'Sin datos de equity — edita acciones manualmente';
+
+    const sharesInput = document.getElementById('sizing-shares');
+    sharesInput.value = sizing.shares;
+
+    stopInput.oninput = _recalcSizingFromRiskOrStop;
+    riskPctInput.oninput = _recalcSizingFromRiskOrStop;
+    sharesInput.oninput = _updateSizingCalc;
+
+    document.getElementById('sizing-confirm-btn').onclick = executeSizingBuy;
+
+    _updateSizingCalc();
+    document.getElementById('sizing-modal').style.display = 'flex';
+}
+
+// When risk% or stop changes → recalculate shares
+function _recalcSizingFromRiskOrStop() {
+    if (!_sizingData || !_sizingData.equity_usd) return;
+    const riskPct = parseFloat(document.getElementById('sizing-risk-pct').value) || 1.0;
+    const stop = parseFloat(document.getElementById('sizing-stop').value) || _sizingData.stop_price;
+    const entry = _sizingData.entry_price;
+    const riskPerShare = entry - stop;
+    if (riskPerShare <= 0) return;
+    const shares = Math.max(1, Math.floor(_sizingData.equity_usd * riskPct / 100 / riskPerShare));
+    document.getElementById('sizing-shares').value = shares;
+    _updateSizingCalc();
+}
+
+function _updateSizingCalc() {
+    if (!_sizingData) return;
+    const shares = parseInt(document.getElementById('sizing-shares').value) || 0;
+    const stop = parseFloat(document.getElementById('sizing-stop').value) || _sizingData.stop_price;
+    const entry = _sizingData.entry_price;
+    const equityUsd = _sizingData.equity_usd || 0;
+
+    const costUsd = shares * entry;
+    const costEur = costUsd / _sizingData.fx_rate;
+    const riskPerShare = Math.max(0, entry - stop);
+    const riskUsd = shares * riskPerShare;
+    const riskPct = equityUsd > 0 ? (riskUsd / equityUsd * 100) : 0;
+
+    setText('sizing-cost-usd', `$${costUsd.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}`);
+    setText('sizing-cost-eur', `€${costEur.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}`);
+    const riskLabel = riskPct > 0
+        ? `$${riskUsd.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})} (${riskPct.toFixed(2)}%)`
+        : `$${riskUsd.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
+    setText('sizing-risk', riskLabel);
+    setText('sizing-fx', _sizingData.fx_rate.toFixed(4));
+
+    // If user is editing shares manually, sync risk% display
+    if (equityUsd > 0 && document.activeElement === document.getElementById('sizing-shares')) {
+        document.getElementById('sizing-risk-pct').value = riskPct.toFixed(2);
+    }
+}
+
+async function executeSizingBuy() {
+    if (!_sizingData) return;
+    const shares = parseInt(document.getElementById('sizing-shares').value) || 0;
+    const stop = parseFloat(document.getElementById('sizing-stop').value) || _sizingData.stop_price;
+    if (shares <= 0) {
+        showToast('Numero de acciones invalido', 'error');
+        return;
+    }
+
     const result = await apiPost('pending', {
-        symbol, action_type: 'BUY', setup_type: setupType,
-        reason: `Aprobación manual desde gráfico (${setupType.toUpperCase()})`,
-        shares: 0, price: 0, stop_price: 0, fx_rate: 1.0
+        symbol: _sizingData.symbol,
+        action_type: 'BUY',
+        setup_type: _sizingData.setupType,
+        reason: `Compra manual (${_sizingData.setupType.toUpperCase()}) - ${shares} accs`,
+        shares: shares,
+        price: _sizingData.entry_price,
+        stop_price: stop,
     });
-    if (result) {
-        showToast(`✅ Señal de ${symbol} añadida a Acciones Sugeridas`, 'success');
-        hideChartModal();
+
+    closeModal('sizing-modal');
+    if (result && result.status === 'created') {
+        showToast(`Orden de compra creada para ${_sizingData.symbol} (${shares} accs)`, 'success');
+        // Close chart modal only if it is currently open
+        const chartModal = document.getElementById('chart-modal');
+        if (chartModal && chartModal.style.display !== 'none') hideChartModal();
         loadAll();
     } else {
-        showToast(`Error procesando señal de ${symbol}`, 'error');
+        showToast(`Error creando orden para ${_sizingData.symbol}`, 'error');
     }
+    _sizingData = null;
 }
 
 
@@ -688,6 +1170,7 @@ async function triggerScan() {
         showToast('Error al iniciar el escaneo.', 'error');
     }
 }
+window.triggerScan = triggerScan;
 
 async function checkScanStatus() {
     const data = IS_LOCAL ? await apiGet('scan/status') : { running: false };
@@ -754,12 +1237,43 @@ async function executeSell() {
     }
 }
 
-function openStopModal(positionId, symbol, currentStop) {
+function openStopModal(positionId, symbol, currentStop, shares, entryPrice) {
     _stopPositionId = positionId;
+    _stopPositionShares = shares || 0;
+    _stopPositionEntry = entryPrice || 0;
     setText('stop-symbol', symbol);
-    setText('stop-current', `€${currentStop.toFixed(2)}`);
+    setText('stop-current', `$${currentStop.toFixed(2)}`);
     document.getElementById('stop-new').value = currentStop.toFixed(2);
     document.getElementById('stop-modal').style.display = 'flex';
+    _updateStopRiskDisplay();
+}
+
+function _updateStopRiskDisplay() {
+    const newStop = parseFloat(document.getElementById('stop-new').value) || 0;
+    const entry = _stopPositionEntry;
+    const shares = _stopPositionShares;
+    const preview = document.getElementById('stop-risk-preview');
+    if (!preview) return;
+
+    if (!entry || !shares || newStop <= 0) {
+        preview.style.display = 'none';
+        return;
+    }
+
+    preview.style.display = 'block';
+    const riskPerShare = entry - newStop;
+    const riskUsd = riskPerShare * shares;
+    const stopDistPct = (riskPerShare / entry * 100);
+    const equityUsd = _equityEur * _fxRate;
+    const riskAccPct = equityUsd > 0 ? (riskUsd / equityUsd * 100) : null;
+
+    setText('stop-risk-usd', `$${Math.max(0, riskUsd).toFixed(2)} USD`);
+    setText('stop-risk-dist', `${Math.max(0, stopDistPct).toFixed(2)}% por debajo de entrada`);
+    setText('stop-risk-acct', riskAccPct !== null ? `${Math.max(0, riskAccPct).toFixed(2)}%` : 'N/A');
+
+    // Color the preview based on risk level
+    const acct = riskAccPct || 0;
+    preview.style.borderColor = acct > 2 ? 'rgba(239,68,68,0.5)' : acct > 1 ? 'rgba(234,179,8,0.4)' : 'rgba(239,68,68,0.25)';
 }
 
 async function executeStopChange() {
@@ -980,4 +1494,228 @@ async function loadAnalytics() {
             }
         }
     });
+}
+
+// ── Watchlist ───────────────────────────────────────────────
+
+async function loadWatchlist() {
+    const items = await apiGet('watchlist');
+    const body = document.getElementById('watchlist-body');
+    const countEl = document.getElementById('watchlist-count');
+    if (!body) return;
+
+    if (!items || items.length === 0) {
+        body.innerHTML = '<div class="empty-state">Sin simbolos en watchlist</div>';
+        if (countEl) countEl.textContent = '0';
+        return;
+    }
+
+    if (countEl) countEl.textContent = items.length;
+
+    body.innerHTML = items.map(item => `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg-card-hover);border-radius:var(--radius-sm);margin-bottom:4px;">
+            <div>
+                <span style="font-weight:bold;cursor:pointer;text-decoration:underline;" onclick="openChartModal('${item.symbol}','breakout')">${item.symbol}</span>
+                ${item.notes ? `<span style="margin-left:8px;color:var(--text-muted);font-size:11px;">${item.notes}</span>` : ''}
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;">
+                <span style="font-size:11px;color:var(--text-muted);">${item.added_date ? item.added_date.split('T')[0] : ''}</span>
+                ${IS_LOCAL ? `<button class="btn-action" style="padding:2px 8px;font-size:11px;border-color:var(--negative);color:var(--negative);" onclick="removeFromWatchlist('${item.symbol}')">X</button>` : ''}
+            </div>
+        </div>
+    `).join('');
+}
+
+async function addToWatchlist(symbol, notes) {
+    const res = await apiPost('watchlist', { symbol, notes: notes || '' });
+    if (res && res.status === 'added') {
+        showToast(`${symbol} agregado a watchlist`, 'success');
+        loadWatchlist();
+    } else {
+        showToast('Error al agregar a watchlist', 'error');
+    }
+}
+
+async function removeFromWatchlist(symbol) {
+    const res = await apiDelete(`watchlist/${symbol}`);
+    if (res && res.status === 'removed') {
+        showToast(`${symbol} eliminado de watchlist`, 'info');
+        loadWatchlist();
+    }
+}
+
+// ── Notifications ──────────────────────────────────────────
+
+async function loadNotifications() {
+    const items = await apiGet('notifications');
+    const body = document.getElementById('notifications-body');
+    const countEl = document.getElementById('notif-count');
+    if (!body) return;
+
+    if (!items || items.length === 0) {
+        body.innerHTML = '<div class="empty-state">Sin notificaciones</div>';
+        if (countEl) countEl.textContent = '0';
+        return;
+    }
+
+    if (countEl) countEl.textContent = items.length;
+
+    body.innerHTML = items.map(n => {
+        const typeIcon = {
+            'signal': '', 'stop': '', 'action': '', 'scan': '', 'error': ''
+        };
+        const icon = typeIcon[n.notif_type] || '';
+        return `
+            <div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px;">
+                <div style="display:flex;justify-content:space-between;">
+                    <span style="font-weight:600;">${icon} ${n.subject}</span>
+                    <span style="color:var(--text-dim);font-size:10px;">${n.ts ? n.ts.split('T')[0] : ''}</span>
+                </div>
+                ${n.body_preview ? `<div style="color:var(--text-muted);margin-top:2px;">${n.body_preview.substring(0, 120)}</div>` : ''}
+            </div>
+        `;
+    }).join('');
+}
+
+// ── Batch AI Analysis ───────────────────────────────────────
+
+let _batchAborted = false;
+
+async function batchAnalyzeSignals() {
+    // Collect READY signal groups, sorted best first (same composite as loadSignals)
+    const readyGroups = Object.entries(_signalGroups)
+        .filter(([, sigs]) => sigs.some(s => s.status === 'ready'))
+        .map(([symbol, sigs]) => {
+            const bestScore = Math.max(...sigs.map(s => s.score || 0));
+            const isMulti = sigs.length > 1;
+            return { symbol, sigs, bestScore, isMulti };
+        })
+        .sort((a, b) => {
+            const ca = a.bestScore + (a.isMulti ? 0.3 : 0);
+            const cb = b.bestScore + (b.isMulti ? 0.3 : 0);
+            return cb - ca;
+        });
+
+    if (readyGroups.length === 0) {
+        alert('No hay señales READY para analizar. Ejecuta un escaneo primero.');
+        return;
+    }
+
+    _batchAborted = false;
+
+    const modal   = document.getElementById('batch-modal');
+    const progDiv = document.getElementById('batch-progress');
+    const bar     = document.getElementById('batch-progress-bar');
+    const statusEl = document.getElementById('batch-status');
+    const resDiv  = document.getElementById('batch-results');
+    const abortBtn = document.getElementById('batch-abort-btn');
+    const closeBtn = document.getElementById('batch-close-btn');
+
+    modal.style.display = 'flex';
+    progDiv.style.display = 'block';
+    resDiv.style.display = 'none';
+    abortBtn.style.display = 'inline-block';
+    closeBtn.style.display = 'none';
+    bar.style.width = '0%';
+
+    const results = [];
+    const total = readyGroups.length;
+
+    for (let i = 0; i < total; i++) {
+        if (_batchAborted) {
+            statusEl.textContent = `Cancelado tras ${i} análisis.`;
+            break;
+        }
+
+        const { symbol, sigs, bestScore } = readyGroups[i];
+        const setupTypes = sigs.map(s => s.setup_type);
+
+        statusEl.textContent = `Analizando ${symbol}… (${i + 1}/${total})`;
+        bar.style.width = `${Math.round((i / total) * 100)}%`;
+
+        try {
+            const res = await fetch('/api/copilot/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ symbol, setup_types: setupTypes })
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            results.push({ symbol, setupTypes, bestScore, ...data });
+        } catch (err) {
+            results.push({ symbol, setupTypes, bestScore, decision: 'ERROR', confianza: '0%', resumen: `Error: ${err.message}` });
+        }
+    }
+
+    bar.style.width = '100%';
+    abortBtn.style.display = 'none';
+    closeBtn.style.display = 'inline-block';
+    progDiv.style.display = 'none';
+    resDiv.style.display = 'block';
+
+    _renderBatchReport(results, total);
+}
+
+function _renderBatchReport(results, total) {
+    const comprar   = results.filter(r => (r.decision || '').toUpperCase() === 'INVERTIR' && parseInt((r.confianza || '0').replace('%', '')) > 0);
+    const descartar = results.filter(r => (r.decision || '').toUpperCase() === 'NO INVERTIR' || r.decision === 'ERROR');
+    const esperar   = results.filter(r => !comprar.includes(r) && !descartar.includes(r));
+
+    const renderGroup = (title, color, border, items, showBuyBtn = false) => {
+        if (!items.length) return '';
+        return `
+            <div style="margin-bottom:18px;">
+                <div style="font-weight:700;color:${color};margin-bottom:8px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;">${title} — ${items.length}</div>
+                ${items.map(r => {
+                    const conf = r.confianza || '0%';
+                    const score = (r.bestScore * 100).toFixed(0);
+                    const setups = (r.setupTypes || []).map(s => s.toUpperCase()).join(' + ');
+                    const primarySetup = (r.setupTypes || [])[0] || 'breakout';
+                    return `
+                        <div onclick="closeModal('batch-modal');openChartModal('${r.symbol}')"
+                             style="padding:10px 12px;background:rgba(0,0,0,0.25);border-left:3px solid ${border};
+                                    border-radius:4px;margin-bottom:6px;cursor:pointer;transition:background .15s;"
+                             onmouseover="this.style.background='rgba(255,255,255,0.05)'"
+                             onmouseout="this.style.background='rgba(0,0,0,0.25)'">
+                            <div style="display:flex;justify-content:space-between;align-items:center;">
+                                <strong style="color:#e2e8f0;font-size:14px;">${r.symbol}</strong>
+                                <div style="display:flex;gap:8px;align-items:center;">
+                                    <span style="font-size:12px;color:${color};font-weight:600;">${conf}</span>
+                                    ${showBuyBtn ? `
+                                        <button onclick="event.stopPropagation(); buyFromBatch('${r.symbol}','${primarySetup}')"
+                                            style="padding:3px 10px;background:rgba(16,185,129,0.2);border:1px solid #10b981;
+                                                   border-radius:4px;color:#4ade80;cursor:pointer;font-weight:bold;font-size:11px;white-space:nowrap;">
+                                            💰 Comprar
+                                        </button>` : ''}
+                                </div>
+                            </div>
+                            <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${setups} · Score ${score}%</div>
+                            ${r.resumen ? `<div style="font-size:11px;color:#94a3b8;margin-top:4px;font-style:italic;">${r.resumen}</div>` : ''}
+                        </div>`;
+                }).join('')}
+            </div>`;
+    };
+
+    document.getElementById('batch-results').innerHTML = `
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:14px;">
+            ${results.length} de ${total} señales READY analizadas
+        </div>
+        ${renderGroup('🟢 Comprar', '#4ade80', '#22c55e', comprar, true)}
+        ${renderGroup('🟡 Esperar', '#facc15', '#eab308', esperar)}
+        ${renderGroup('🔴 Descartar', '#f87171', '#ef4444', descartar)}
+    `;
+}
+
+async function buyFromBatch(symbol, setupType) {
+    showToast(`Calculando sizing para ${symbol}...`, 'info');
+    const sizing = await apiGet(`sizing/${symbol}?setup_type=${setupType}&score=0.8`);
+    if (!sizing || sizing.error) {
+        showToast(sizing?.error || `Error calculando sizing para ${symbol}`, 'error');
+        return;
+    }
+    showSizingModal(symbol, setupType, sizing);
+}
+
+function abortBatchAnalysis() {
+    _batchAborted = true;
 }

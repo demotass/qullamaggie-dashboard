@@ -1,9 +1,6 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-<!DOCTYPE html>
-<html lang="es">
-<head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qullamaggie Scanner — Dashboard</title>
@@ -18,8 +15,17 @@
     <!-- Auto-hide PIN for localhost -->
     <script>
         (function() {
-            const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname.startsWith('192.168.');
+            const isLocal = location.hostname === 'localhost' 
+                || location.hostname === '127.0.0.1' 
+                || location.hostname.startsWith('192.168.')
+                || location.hostname.startsWith('10.')
+                || location.hostname.startsWith('172.');
+
             if (isLocal || sessionStorage.getItem('qlm_auth') === 'true') {
+                const style = document.createElement('style');
+                style.innerHTML = '#auth-overlay { display: none !important; }';
+                document.head.appendChild(style);
+                
                 document.addEventListener('DOMContentLoaded', () => {
                     const overlay = document.getElementById('auth-overlay');
                     if (overlay) overlay.style.display = 'none';
@@ -90,6 +96,10 @@
                 <div class="stat-label">Trades Totales</div>
                 <div class="stat-value" id="stat-trades">0</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-label">Riesgo Abierto</div>
+                <div class="stat-value" id="stat-risk">$0 (0%)</div>
+            </div>
         </section>
 
         <!-- Copilot Pending Actions -->
@@ -128,10 +138,40 @@
                             <option value="parabolic">Parabolic</option>
                             <option value="vcp">VCP</option>
                         </select>
+                        <button class="btn btn-sm" onclick="batchAnalyzeSignals()"
+                            title="Analiza las señales READY con IA y genera un informe"
+                            style="margin-left:8px;padding:4px 10px;font-size:11px;background:rgba(139,92,246,0.15);border:1px solid rgba(139,92,246,0.4);color:#a78bfa;border-radius:4px;cursor:pointer;">
+                            🧠 Informe IA
+                        </button>
                     </div>
                 </div>
                 <div class="panel-body" id="signals-body">
                     <div class="empty-state">Sin señales detectadas</div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Watchlist + Notifications row -->
+        <div class="main-grid">
+            <!-- Watchlist -->
+            <section class="panel" id="watchlist-panel">
+                <div class="panel-header">
+                    <h2>Watchlist</h2>
+                    <span class="badge badge-count" id="watchlist-count">0</span>
+                </div>
+                <div class="panel-body" id="watchlist-body">
+                    <div class="empty-state">Sin simbolos en watchlist</div>
+                </div>
+            </section>
+
+            <!-- Notifications -->
+            <section class="panel" id="notifications-panel">
+                <div class="panel-header">
+                    <h2>Notificaciones</h2>
+                    <span class="badge badge-count" id="notif-count">0</span>
+                </div>
+                <div class="panel-body" id="notifications-body" style="max-height:300px;overflow-y:auto;">
+                    <div class="empty-state">Sin notificaciones</div>
                 </div>
             </section>
         </div>
@@ -254,13 +294,96 @@
                 <div id="tv-chart-stoch" class="chart-panel-osc" style="display:none;"></div>
             </div>
             <!-- Footer actions -->
-            <div class="chart-modal-footer">
-                <div class="chart-signal-info" id="chart-signal-info"></div>
-                <div class="chart-actions">
-                    <button class="btn btn-primary" id="chart-btn-buy">✅ Aprobar / Comprar</button>
-                    <button class="btn btn-secondary" id="chart-btn-wait">👀 Esperar / Vigilar</button>
-                    <button class="btn btn-danger" id="chart-btn-discard">❌ Descartar</button>
+            <div class="chart-modal-footer" style="flex-direction: column; align-items: stretch; gap: 12px;">
+                <!-- Position info bar (shown when chart opened from a position) -->
+                <div id="chart-position-info" style="display:none; background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.3); border-radius: 6px; padding: 8px 14px; font-size: 13px; gap: 20px; align-items: center; flex-wrap: wrap;"></div>
+
+                <!-- AI Copilot Results Area -->
+                <div id="chart-copilot-area" style="display:none; background: rgba(30,58,138,0.15); border: 1px solid rgba(59,130,246,0.3); border-radius: 8px; padding: 12px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; align-items: center;">
+                        <strong style="color: #60a5fa; font-size: 14px;">🤖 Qullamaggie Copilot AI</strong>
+                        <span id="copilot-decision" style="font-size: 12px; font-weight: bold; padding: 4px 8px; border-radius: 4px;"></span>
+                    </div>
+                    <div id="copilot-valoracion" style="font-size: 13px; color: #cbd5e1; line-height: 1.5; margin-bottom: 8px;"></div>
+                    <div id="copilot-resumen" style="display:none; font-size: 13px; font-weight: bold; padding: 8px 12px; border-radius: 6px; margin-bottom: 8px; border-left: 3px solid;"></div>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div style="font-size: 12px; color: #94a3b8;">Confianza: <span id="copilot-confianza" style="color: #f8fafc; font-weight: bold;"></span></div>
+                        <button id="copilot-history-btn" style="display:none; font-size:11px; padding:3px 8px; background:rgba(59,130,246,0.15); border:1px solid rgba(59,130,246,0.4); border-radius:4px; color:#93c5fd; cursor:pointer;">📋 Ver historial IA</button>
+                    </div>
+                    <!-- AI History for position -->
+                    <div id="copilot-history-area" style="display:none; margin-top:10px; border-top: 1px solid rgba(59,130,246,0.2); padding-top:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                            <strong style="color: #94a3b8; font-size: 12px;">Historial de análisis IA</strong>
+                            <button onclick="document.getElementById('copilot-history-area').style.display='none'; document.getElementById('copilot-history-btn').style.display='flex';" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:14px;">✕</button>
+                        </div>
+                        <div id="copilot-history-list" style="max-height:160px; overflow-y:auto;"></div>
+                    </div>
                 </div>
+
+                <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                    <div class="chart-signal-info" id="chart-signal-info"></div>
+                    <div class="chart-actions">
+                        <button class="btn" id="chart-btn-copilot" style="background: linear-gradient(135deg, #1e3a8a, #3b82f6); color: white; border: none; font-weight: bold;">🧠 Analizar con IA</button>
+                        <button class="btn btn-primary" id="chart-btn-buy">✅ Aprobar / Comprar</button>
+                        <button class="btn btn-secondary" id="chart-btn-wait">👀 Esperar / Vigilar</button>
+                        <button class="btn btn-danger" id="chart-btn-discard">❌ Descartar</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sizing / Buy Confirmation Modal -->
+    <div class="modal-backdrop" id="sizing-modal" style="display:none;">
+        <div class="modal-content" style="max-width:480px;">
+            <h3>Confirmar Compra</h3>
+            <div class="modal-body">
+                <div class="modal-field">
+                    <label>Simbolo</label>
+                    <div class="modal-value" id="sizing-symbol" style="font-size:18px;font-weight:bold;"></div>
+                </div>
+                <div class="modal-field">
+                    <label>Setup</label>
+                    <div class="modal-value" id="sizing-setup"></div>
+                </div>
+                <div class="modal-field">
+                    <label>Precio de Entrada (USD)</label>
+                    <div class="modal-value" id="sizing-price"></div>
+                </div>
+                <div class="modal-field">
+                    <label>Stop Loss (USD) <span style="color:var(--text-muted);font-size:11px;font-weight:normal;">— editable</span></label>
+                    <input type="number" id="sizing-stop" min="0" step="0.01" style="color:var(--negative);">
+                </div>
+                <div class="modal-field">
+                    <label>Riesgo % Cuenta <span style="color:var(--text-muted);font-size:11px;font-weight:normal;">— recalcula acciones</span></label>
+                    <input type="number" id="sizing-risk-pct" min="0.1" max="10" step="0.1" style="font-size:16px;font-weight:bold;">
+                </div>
+                <div class="modal-field">
+                    <label>Acciones</label>
+                    <input type="number" id="sizing-shares" min="1" step="1" style="font-size:16px;font-weight:bold;">
+                </div>
+                <div style="background:var(--bg-card-hover);padding:12px;border-radius:var(--radius-sm);margin-top:8px;">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span style="color:var(--text-muted);">Coste Total (USD)</span>
+                        <span id="sizing-cost-usd" style="font-family:var(--font-mono);font-weight:bold;"></span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span style="color:var(--text-muted);">Coste Total (EUR)</span>
+                        <span id="sizing-cost-eur" style="font-family:var(--font-mono);font-weight:bold;"></span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                        <span style="color:var(--text-muted);">Riesgo Total</span>
+                        <span id="sizing-risk" style="font-family:var(--font-mono);color:var(--negative);font-weight:bold;"></span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;">
+                        <span style="color:var(--text-muted);">FX Rate (USD/EUR)</span>
+                        <span id="sizing-fx" style="font-family:var(--font-mono);"></span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-cancel" onclick="closeModal('sizing-modal')">Cancelar</button>
+                <button class="btn btn-primary" id="sizing-confirm-btn" onclick="executeSizingBuy()">Confirmar Compra</button>
             </div>
         </div>
     </div>
@@ -337,12 +460,55 @@
                 </div>
                 <div class="modal-field">
                     <label>Nuevo Stop ($)</label>
-                    <input type="number" id="stop-new" min="0" step="0.01">
+                    <input type="number" id="stop-new" min="0" step="0.01" oninput="_updateStopRiskDisplay()">
+                </div>
+                <div id="stop-risk-preview" style="display:none;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px 12px;font-size:13px;margin-top:4px;">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                        <span style="color:var(--text-muted);">Riesgo por operación</span>
+                        <span id="stop-risk-usd" style="font-family:var(--font-mono);color:var(--negative);font-weight:bold;"></span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                        <span style="color:var(--text-muted);">Stop vs entrada</span>
+                        <span id="stop-risk-dist" style="font-family:var(--font-mono);color:var(--negative);"></span>
+                    </div>
+                    <div style="display:flex;justify-content:space-between;">
+                        <span style="color:var(--text-muted);">% del total cuenta</span>
+                        <span id="stop-risk-acct" style="font-family:var(--font-mono);color:var(--negative);font-weight:bold;"></span>
+                    </div>
                 </div>
             </div>
             <div class="modal-actions">
                 <button class="btn btn-cancel" onclick="closeModal('stop-modal')">Cancelar</button>
                 <button class="btn btn-primary" onclick="executeStopChange()">Actualizar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Batch AI Analysis Report Modal -->
+    <div class="modal-backdrop" id="batch-modal" style="display:none;">
+        <div class="modal-content" style="max-width:600px;max-height:82vh;display:flex;flex-direction:column;">
+            <h3 style="margin:0 0 16px;font-size:16px;">📊 Informe de Análisis IA — Señales READY</h3>
+
+            <!-- Progress state -->
+            <div id="batch-progress" style="padding:24px 0;text-align:center;">
+                <div style="display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:10px;">
+                    <span class="spinner"></span>
+                    <span id="batch-status" style="color:var(--text-muted);font-size:13px;">Iniciando...</span>
+                </div>
+                <div id="batch-progress-bar-wrap" style="width:100%;background:rgba(255,255,255,0.08);border-radius:4px;height:4px;overflow:hidden;">
+                    <div id="batch-progress-bar" style="height:4px;background:#8b5cf6;width:0%;transition:width 0.4s;"></div>
+                </div>
+                <div style="font-size:11px;color:var(--text-dim);margin-top:8px;">
+                    El análisis puede tardar varios minutos. Puedes cancelar en cualquier momento.
+                </div>
+            </div>
+
+            <!-- Results state -->
+            <div id="batch-results" style="display:none;overflow-y:auto;flex:1;"></div>
+
+            <div class="modal-actions" style="margin-top:12px;flex-shrink:0;">
+                <button id="batch-abort-btn" class="btn btn-cancel" onclick="abortBatchAnalysis()" style="display:none;">Cancelar</button>
+                <button id="batch-close-btn" class="btn btn-primary" onclick="closeModal('batch-modal')" style="display:none;">Cerrar</button>
             </div>
         </div>
     </div>
